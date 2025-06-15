@@ -1,0 +1,6 @@
+{
+	local sonnetry = self,
+
+	envvar(name):: std.native("envvar")(name),	
+	path():: std.native("path")()
+}

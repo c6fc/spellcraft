@@ -1,0 +1,39 @@
+{
+  "dependencies": {
+    "@hanazuki/node-jsonnet": "^0.4.2",
+    "ini": "^5.0.0",
+    "js-yaml": "^4.1.0",
+    "yargs": "^17.2.1"
+  },
+  "name": "@c6fc/spellcraft",
+  "description": "Extensible JSonnet CLI platform",
+  "version": "0.0.1",
+  "main": "src/index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "bin": {
+    "spellcraft": "bin/spellcraft.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "doc": "jsdoc -c jsdoc.json --verbose"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/c6fc/spellcraft.git"
+  },
+  "keywords": [
+    "jsonnet"
+  ],
+  "author": "Brad Woodward (brad@bradwoodward.io)",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/c6fc/spellcraft/issues"
+  },
+  "homepage": "https://github.com/c6fc/spellcraft#readme",
+  "devDependencies": {
+    "clean-jsdoc-theme": "^4.3.0",
+    "jsdoc": "^4.0.4"
+  }
+}

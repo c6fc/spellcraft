@@ -1,0 +1,5 @@
+node_modules
+render
+lib/modules
+modules/**
+docs
