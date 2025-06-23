@@ -314,7 +314,6 @@ exports.SpellFrame = class SpellFrame {
      */
     async importSpellCraftModuleFromNpm(npmPackage, name = false) {
         const npmPath = path.resolve(baseDir, 'node_modules', npmPackage);
-
         if (!fs.existsSync(npmPath)) {
             console.log(`[+] Attempting to install ${npmPackage}...`);
             // Note: `spawnSync` is blocking. For a CLI tool, this might be acceptable.
@@ -342,40 +341,54 @@ exports.SpellFrame = class SpellFrame {
             throw new Error(`[!] No import name specified for ${npmPackage}, and it has no 'spellcraft_module_default_name' in its package.json config.`);
         }
 
-        const packagesDirPath = path.join(baseDir, 'spellcraft_modules');
-        if (!fs.existsSync(packagesDirPath)) {
-            fs.mkdirSync(packagesDirPath, { recursive: true });
+        // Check if this project is also a module, which shouldn't contain a spellcraft_modules directory.
+        const thisPackageJsonPath = path.join(baseDir, 'package.json');
+        if (!fs.existsSync(npmPath)) {
+            throw new Error(`[!] There's no package.json for your project. Create one with 'npm init' first`);
         }
 
-        const packagesFilePath = path.join(packagesDirPath, 'packages.json');
-        let packages = {};
-        if (fs.existsSync(packagesFilePath)) {
-            try {
-                packages = JSON.parse(fs.readFileSync(packagesFilePath, 'utf-8'));
-            } catch (e) {
-                console.warn(`[!] Could not parse existing ${packagesFilePath}. Starting fresh. Error: ${e.message}`);
-                packages = {};
+        const thisPackageConfig = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+        const thisSpellcraftConfig = packageConfig.config || packageConfig.spellcraft; // Allow 'spellcraft' key too
+
+        // Only link if this package is not a module itself.
+        if (!!!thisSpellcraftConfig?.spellcraft_module_default_name) {
+
+            const packagesDirPath = path.join(baseDir, 'spellcraft_modules');
+            if (!fs.existsSync(packagesDirPath)) {
+                fs.mkdirSync(packagesDirPath, { recursive: true });
             }
+
+            const packagesFilePath = path.join(packagesDirPath, 'packages.json');
+            let packages = {};
+            if (fs.existsSync(packagesFilePath)) {
+                try {
+                    packages = JSON.parse(fs.readFileSync(packagesFilePath, 'utf-8'));
+                } catch (e) {
+                    console.warn(`[!] Could not parse existing ${packagesFilePath}. Starting fresh. Error: ${e.message}`);
+                    packages = {};
+                }
+            }
+
+            // Derive the base name to store (e.g., "my-package" from "my-package@1.0.0")
+            const npmPackageBaseName = npmPackage.startsWith("@") ?
+                `@${npmPackage.split('/')[1].split('@')[0]}` : // Handles @scope/name and @scope/name@version
+                npmPackage.split('@')[0]; // Handles name and name@version
+
+            const packagesKey = name || spellcraftConfig.spellcraft_module_default_name;
+            packages[packagesKey] = npmPackageBaseName; // Store the clean package name
+
+            fs.writeFileSync(packagesFilePath, JSON.stringify(packages, null, "\t"));
+            console.log(`[+] Linked ${npmPackage} as SpellCraft module '${packagesKey}'`);
+            
+        } else {
+            console.log(`[+] Module installed, but not linked because the current project is also a module.`);
+            console.log(`    You can use the module's JS native functions, or import its JSonnet modules.`);
         }
-
-        // Derive the base name to store (e.g., "my-package" from "my-package@1.0.0")
-        const npmPackageBaseName = npmPackage.startsWith("@") ?
-            `@${npmPackage.split('/')[1].split('@')[0]}` : // Handles @scope/name and @scope/name@version
-            npmPackage.split('@')[0]; // Handles name and name@version
-
-        const packagesKey = name || spellcraftConfig.spellcraft_module_default_name;
-        packages[packagesKey] = npmPackageBaseName; // Store the clean package name
-
-        fs.writeFileSync(packagesFilePath, JSON.stringify(packages, null, "\t"));
-        console.log(`[+] Linked ${npmPackage} as SpellCraft module '${packagesKey}'`);
-
-        // After linking, ensure it's loaded for the current session
-        this.loadModuleByName(packagesKey, npmPackageBaseName);
     }
 
     /**
      * Evaluates a Jsonnet file and stores the result.
-     * This also sets up the dynamic `modules/modules.libsonnet` import aggregator.
+     * This also sets up the dynamic `modules/modules` import aggregator.
      * @param {string} file - The path to the main Jsonnet file to evaluate.
      * @async
      * @returns {Promise<object>} The parsed JSON object from the Jsonnet evaluation.
@@ -390,7 +403,7 @@ exports.SpellFrame = class SpellFrame {
         this.activePath = path.dirname(absoluteFilePath); // Set active path for relative 'path()' calls
 
         // Path to the dynamically generated libsonnet file that imports all modules
-        const dynamicModulesImportFile = path.resolve(__dirname, '../modules/modules.libsonnet');
+        const dynamicModulesImportFile = path.resolve(__dirname, '../modules/modules');
 
         // It's crucial this file is managed carefully.
         // If it exists from a previous failed run or other reasons, it might cause issues.
@@ -416,16 +429,17 @@ exports.SpellFrame = class SpellFrame {
             throw new Error(`Jsonnet Evaluation Error for ${absoluteFilePath}: ${e.message || e}`);
         }
 
-        // Clean up the dynamically generated modules.libsonnet after rendering,
+        // Clean up the modules folder after rendering,
         // as it's specific to this render pass and its discovered modules.
-        // This was previously cleaning the whole modules directory, which might be too broad
-        // if other static .libsonnet files are meant to be there.
-        if (fs.existsSync(dynamicModulesImportFile)) {
-            try {
-                fs.unlinkSync(dynamicModulesImportFile);
-            } catch (e) {
-                console.warn(`[!] Could not clean up temporary module file ${dynamicModulesImportFile}: ${e.message}`);
-            }
+        try {
+            const modulePath = path.resolve(__dirname, '../modules');
+
+            fs.readdirSync(modulePath)
+                .map(e => path.join(modulePath, e))
+                // .forEach(e => fs.unlinkSync(e));
+
+        } catch (e) {
+            console.warn(`[!] Could not clean up temporary module file ${dynamicModulesImportFile}: ${e.message}`);
         }
         
         return this.lastRender;
@@ -433,7 +447,7 @@ exports.SpellFrame = class SpellFrame {
 
     /**
      * Loads SpellCraft modules by scanning the `spellcraft_modules` directory for `.js` files.
-     * Generates a `modules.libsonnet` file in `../modules/` to make them importable in Jsonnet.
+     * Generates a `modules` file in `../modules/` to make them importable in Jsonnet.
      * @param {string} aggregateModuleFile - The path where the aggregating libsonnet file will be written.
      * @returns {Array<string>} A list of registered function names from the loaded modules.
      */
@@ -443,6 +457,13 @@ exports.SpellFrame = class SpellFrame {
             // Ensure the aggregate file is empty if no modules found
             fs.writeFileSync(aggregateModuleFile, '{}', 'utf-8');
             return [];
+        }
+
+        const spellcraftConfig = packageConfig.config || packageConfig.spellcraft; // Allow 'spellcraft' key too
+
+        if (!!spellcraftConfig?.spellcraft_module_default_name) {
+            console.log("This package is a SpellCraft module. Skipping directory-based module import.");
+            return []
         }
 
         const jsModuleFiles = fs.readdirSync(spellcraftModulesPath)
@@ -484,13 +505,13 @@ exports.SpellFrame = class SpellFrame {
      * @private
      * @param {string} moduleKey - The key (alias) under which the module is registered.
      * @param {string} npmPackageName - The actual npm package name.
-     * @returns {string|null} The moduleKey if successful, null otherwise.
+     * @returns {string|false} The moduleKey if successful, null otherwise.
      */
     loadModuleByName(moduleKey, npmPackageName) {
         const packageJsonPath = path.join(baseDir, 'node_modules', npmPackageName, 'package.json');
         if (!fs.existsSync(packageJsonPath)) {
             console.warn(`[!] package.json not found for module '${moduleKey}' (package: ${npmPackageName}) at ${packageJsonPath}. Skipping.`);
-            return null;
+            return false;
         }
 
         let packageConfig;
@@ -498,7 +519,7 @@ exports.SpellFrame = class SpellFrame {
             packageConfig = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
         } catch (e) {
             console.warn(`[!] Error parsing package.json for module '${moduleKey}' (package: ${npmPackageName}): ${e.message}. Skipping.`);
-            return null;
+            return false;
         }
 
         if (!packageConfig.main) {
@@ -506,7 +527,8 @@ exports.SpellFrame = class SpellFrame {
         } else {
             const jsMainFilePath = path.resolve(baseDir, 'node_modules', npmPackageName, packageConfig.main);
             if (fs.existsSync(jsMainFilePath)) {
-                this.loadFunctionsFromFile(jsMainFilePath);
+                const { functions } = this.loadFunctionsFromFile(jsMainFilePath);
+                console.log(`[+] Imported JavaScript native [${functions.join(', ')}] into module '${moduleKey}'`);
             } else {
                 console.warn(`[!] Main JS file '${jsMainFilePath}' not found for module '${moduleKey}'. Skipping JS function loading.`);
             }
@@ -537,7 +559,7 @@ exports.SpellFrame = class SpellFrame {
                 // Ensure the target directory exists
                 fs.mkdirSync(path.dirname(targetLibsonnetPath), { recursive: true });
                 fs.copyFileSync(sourceLibsonnetPath, targetLibsonnetPath);
-                console.log(`[+] Copied libsonnet module for '${moduleKey}' from ${sourceLibsonnetPath} to ${targetLibsonnetPath}`);
+                console.log(`[+] Copied libsonnet module for '${moduleKey}'`);
             } catch (e) {
                 console.warn(`[!] Failed to copy libsonnet module for '${moduleKey}': ${e.message}`);
             }
@@ -550,7 +572,7 @@ exports.SpellFrame = class SpellFrame {
 
     /**
      * Loads native functions from a list of JavaScript module files and generates
-     * an aggregate Jsonnet import file (`modules.libsonnet` by default convention).
+     * an aggregate Jsonnet import file (`modules` by default convention).
      * @param {string[]} jsModuleFiles - An array of absolute paths to JS module files.
      * @param {string} aggregateModuleFile - The path to the Jsonnet file that will aggregate imports.
      * @returns {{registeredFunctions: string[], magicContent: string[]}}
@@ -579,66 +601,8 @@ exports.SpellFrame = class SpellFrame {
         if (!fs.existsSync(aggregateFileDir)) {
             fs.mkdirSync(aggregateFileDir, { recursive: true });
         }
-        // This content creates a Jsonnet object where keys are module names
-        // and values are their corresponding .libsonnet imports.
-        // It's assumed that loadModuleByName has already copied relevant .libsonnet files
-        // into the ../modules directory, named like <moduleKey>.libsonnet
-        const packagesConfigPath = path.join(baseDir, 'spellcraft_modules', 'packages.json');
-        let moduleImportsString = "";
-        if (fs.existsSync(packagesConfigPath)) {
-            try {
-                const packages = JSON.parse(fs.readFileSync(packagesConfigPath, 'utf-8'));
-                moduleImportsString = Object.keys(packages)
-                    .map(key => `  ${key}: import "${key}.libsonnet"`) // Assumes <key>.libsonnet exists in jpath
-                    .join(",\n");
-            } catch (e) {
-                console.warn(`[!] Error processing packages.json for libsonnet aggregation: ${e.message}`);
-            }
-        }
         
-        // The aggregateModuleFile ('modules/modules.libsonnet') will now look like:
-        // {
-        //   moduleKey1: import "moduleKey1.libsonnet",
-        //   moduleKey2: import "moduleKey2.libsonnet",
-        //   // ... any other native functions directly defined
-        // }
-        // Native functions defined via loadFunctionsFromFile are added directly to jsonnet instance,
-        // and their `std.native` calls are generated by loadFunctionsFromFile's `magicContent`.
-        // The `modules.libsonnet` is primarily for importing `.libsonnet` files from packages.
-        // The `magicContent` from JS files might need a different aggregation strategy
-        // if they are meant to be part of this central `modules.libsonnet`.
-        // For now, `allMagicContent` seems to be intended for a different purpose or needs clarification.
-        // If `magicContent` is for defining native functions in a libsonnet structure, it needs to be integrated.
-        // The current `magicContent.join(",\n")` assumes it's creating entries for a Jsonnet object.
-        // Let's assume modules.libsonnet is for Jsonnet library imports, and native functions are separate.
-        //
-        // Revision: If `allMagicContent` is for `std.native` declarations,
-        // those are typically not put inside `modules.libsonnet` but rather are available globally
-        // once `addNativeFunction` is called. The `modules.libsonnet` file is for Jsonnet code.
-        // The `magicContent` was generating strings like `\t${e}(${parameters.join(', ')}):: std.native('${e}')(${parameters.join(', ')})`
-        // This is Jsonnet code. If this is meant to be *the* content of `modules.libsonnet`,
-        // then the `moduleImportsString` part is separate.
-        //
-        // Let's clarify:
-        // 1. `../modules/<moduleKey>.libsonnet`: Copied from each package.
-        // 2. `../modules/modules.libsonnet`: This file should make #1 easily accessible.
-        //    Example: `{ myModule: import "myModule.libsonnet" }`
-        // 3. Native JS functions: Registered directly with `this.jsonnet.nativeCallback`.
-        //    They are globally available in Jsonnet via `std.native('funcName')`.
-        // The `magicContent` seems to be an attempt to create a .libsonnet wrapper for native functions.
-        // This is good practice! So `modules.libsonnet` could combine these.
-
-        let finalModulesContent = "{\n";
-        if (moduleImportsString) {
-            finalModulesContent += moduleImportsString;
-        }
-        if (allMagicContent.length > 0) {
-            if (moduleImportsString) finalModulesContent += ",\n"; // Add comma if previous content exists
-            finalModulesContent += allMagicContent.join(",\n");
-        }
-        finalModulesContent += "\n}";
-
-        fs.writeFileSync(aggregateModuleFile, finalModulesContent, 'utf-8');
+        fs.writeFileSync(aggregateModuleFile, `{\n${magicContent.join(",\n")}\n}`, 'utf-8');
 
         if (jsModuleFiles.length > 0) {
             console.log(`[+] Processed ${jsModuleFiles.length} JS module file(s) for native functions.`);
@@ -698,7 +662,7 @@ exports.SpellFrame = class SpellFrame {
                     return null;
                 }
                 
-                // For `modules.libsonnet` to provide convenient wrappers:
+                // For `modules` to provide convenient wrappers:
                 // e.g. myNativeFunc(a,b):: std.native('myNativeFunc')(a,b)
                 const paramString = params.join(', ');
                 magicContentSnippets.push(`  ${funcName}(${paramString}):: std.native('${funcName}')(${paramString})`);

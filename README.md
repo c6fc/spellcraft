@@ -7,7 +7,7 @@ Spellcraft is an opinionated approach to manifesting and applying configurations
 Install spellcraft with `npm install` and add plugins with `npx spellcraft importModule`
 
 ```sh
-$ npm i -p spellcraft
+$ npm i -p @c6fc/spellcraft
 $ npx spellcraft importModule @c6fc/spellcraft-packer packer
 ```
 
