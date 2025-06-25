@@ -320,7 +320,7 @@ exports.SpellFrame = class SpellFrame {
             console.log(`[+] Attempting to install ${npmPackage}...`);
             // Note: `spawnSync` is blocking. For a CLI tool, this might be acceptable.
             // Consider an async alternative if this needs to be non-blocking.
-            const install = spawnSync(`npm`, ['install', '--save-dev', npmPackage], { // Using --save-dev for local project context
+            const install = spawnSync(`npm`, ['install', '--save', npmPackage], { // Using --save-dev for local project context
                 cwd: baseDir, // Install in the project's node_modules, not renderPath
                 stdio: 'inherit' // Show npm output directly
             });
