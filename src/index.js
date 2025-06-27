@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const yaml = require('js-yaml');
 const crypto = require('crypto');
+const colors = require('@colors/colors');
 const { spawnSync } = require('child_process');
 const { Jsonnet } = require("@hanazuki/node-jsonnet");
 
@@ -181,6 +182,7 @@ exports.SpellFrame = class SpellFrame {
         this.functionContext = {};
         this.lastRender = null;
         this.activePath = null;
+        this.loadedModules = [];
 
         this.jsonnet = new Jsonnet()
             .addJpath(path.join(__dirname, '../lib')) // For core SpellCraft libsonnet files
@@ -190,7 +192,7 @@ exports.SpellFrame = class SpellFrame {
         this.addNativeFunction("envvar", (name) => process.env[name] || false, "name");
         this.addNativeFunction("path", () => this.activePath || process.cwd()); // Use activePath if available
 
-        this.loadModulesFromPackageList();
+        this.loadedModules = this.loadModulesFromPackageList();
     }
 
     /**
@@ -318,23 +320,27 @@ exports.SpellFrame = class SpellFrame {
         const npmPath = path.resolve(baseDir, 'node_modules', npmPackage);
         if (!fs.existsSync(npmPath)) {
             console.log(`[+] Attempting to install ${npmPackage}...`);
-            // Note: `spawnSync` is blocking. For a CLI tool, this might be acceptable.
-            // Consider an async alternative if this needs to be non-blocking.
+            
             const install = spawnSync(`npm`, ['install', '--save', npmPackage], { // Using --save-dev for local project context
-                cwd: baseDir, // Install in the project's node_modules, not renderPath
-                stdio: 'inherit' // Show npm output directly
+                cwd: baseDir,
+                stdio: 'inherit'
             });
+
             if (install.error || install.status !== 0) {
-                throw new Error(`Failed to install npm package ${npmPackage}. Error: ${install.error || install.stderr.toString()}`);
+                throw new Error(`Failed to install npm package ${npmPackage.blue}. Error: ${install.error.red || install.stderr.toString().red}`);
             }
-            console.log(`[+] Successfully installed ${npmPackage}.`);
+
+            console.log(`[+] Successfully installed ${npmPackage.blue}.`);
         }
+
+        const moduleJson = JSON.parse(fs.readFileSync(path.join(npmPath, 'package.json')));
+        const moduleConfig = moduleJson.config || moduleJson.spellcraft; // Allow 'spellcraft' key too
 
         const spellcraftConfig = thisPackage.config || thisPackage.spellcraft; // Allow 'spellcraft' key too
 
-        if (!name && !spellcraftConfig?.spellcraft_module_default_name) {
-            console.log("Package config:", thisPackage);
-            throw new Error(`[!] No import name specified for ${npmPackage}, and it has no 'spellcraft_module_default_name' in its package.json config.`);
+        if (!name && !!!moduleConfig?.spellcraft_module_default_name) {
+            console.log("Package config:", moduleJson);
+            throw new Error(`[!] No import name specified for ${npmPackage}, and it has no 'spellcraft_module_default_name' in its package.json config.`.red);
         }
 
         // Only link if this package is not a module itself.
@@ -351,7 +357,7 @@ exports.SpellFrame = class SpellFrame {
                 try {
                     packages = JSON.parse(fs.readFileSync(packagesFilePath, 'utf-8'));
                 } catch (e) {
-                    console.warn(`[!] Could not parse existing ${packagesFilePath}. Starting fresh. Error: ${e.message}`);
+                    console.warn(`[!] Could not parse existing ${packagesFilePath}. Starting fresh. Error: ${e.message}`.red);
                     packages = {};
                 }
             }
@@ -361,7 +367,7 @@ exports.SpellFrame = class SpellFrame {
                 `@${npmPackage.split('/')[1].split('@')[0]}` : // Handles @scope/name and @scope/name@version
                 npmPackage.split('@')[0]; // Handles name and name@version
 
-            const packagesKey = name || spellcraftConfig.spellcraft_module_default_name;
+            const packagesKey = name || moduleConfig.spellcraft_module_default_name;
             packages[npmPackage] = packagesKey; // Store the clean package name
 
             fs.writeFileSync(packagesFilePath, JSON.stringify(packages, null, "\t"));
@@ -396,20 +402,34 @@ exports.SpellFrame = class SpellFrame {
             fs.unlinkSync(dynamicModulesImportFile);
         }
         
+        const { magicContent, registeredFunctions } = this.loadModulesFromModuleDirectory(dynamicModulesImportFile);
 
-        this.loadModulesFromModuleDirectory(dynamicModulesImportFile);
+        const aggregateFileDir = path.dirname(dynamicModulesImportFile);
+        if (!fs.existsSync(aggregateFileDir)) {
+            fs.mkdirSync(aggregateFileDir, { recursive: true });
+        }
+
+        magicContent.push(this.loadedModules.flatMap(e => {
+            return `\t${e}: import '${e}.libsonnet',`
+        }));
+
+        fs.writeFileSync(dynamicModulesImportFile, `{\n${magicContent.join(",\n")}\n}`, 'utf-8');
+
+        if (registeredFunctions.length > 0) {
+             console.log(`[+] Registered ${registeredFunctions.length} native function(s): [ ${registeredFunctions.sort().join(', ').cyan} ]`);
+        }
+
+        if (magicContent.length > 0) {
+            console.log(`[+] Aggregated modules written to '${path.basename(dynamicModulesImportFile).green}'`);
+        }
 
         // Ensure renderPath does not have a trailing slash for consistency
         if (this.renderPath.endsWith(path.sep)) {
             this.renderPath = this.renderPath.slice(0, -1);
         }
 
-        try {
-            console.log(`[+] Evaluating Jsonnet file: ${absoluteFilePath}`);
-            this.lastRender = JSON.parse(await this.jsonnet.evaluateFile(absoluteFilePath));
-        } catch (e) {
-            throw new Error(`Jsonnet Evaluation Error for ${absoluteFilePath}: ${e.message || e}`);
-        }
+        console.log(`[+] Evaluating Jsonnet file ${path.basename(absoluteFilePath).green}`);
+        this.lastRender = JSON.parse(await this.jsonnet.evaluateFile(absoluteFilePath));
 
         // Clean up the modules folder after rendering,
         // as it's specific to this render pass and its discovered modules.
@@ -418,7 +438,7 @@ exports.SpellFrame = class SpellFrame {
 
             fs.readdirSync(modulePath)
                 .map(e => path.join(modulePath, e))
-                // .forEach(e => fs.unlinkSync(e));
+                .forEach(e => fs.unlinkSync(e));
 
         } catch (e) {
             console.warn(`[!] Could not clean up temporary module file ${dynamicModulesImportFile}: ${e.message}`);
@@ -429,30 +449,26 @@ exports.SpellFrame = class SpellFrame {
 
     /**
      * Loads SpellCraft modules by scanning the `spellcraft_modules` directory for `.js` files.
-     * Generates a `modules` file in `../modules/` to make them importable in Jsonnet.
-     * @param {string} aggregateModuleFile - The path where the aggregating libsonnet file will be written.
-     * @returns {Array<string>} A list of registered function names from the loaded modules.
+     * @returns {Object} A list of registered function names from the loaded modules.
      */
-    loadModulesFromModuleDirectory(aggregateModuleFile) {
+    loadModulesFromModuleDirectory() {
         const spellcraftModulesPath = path.join(baseDir, 'spellcraft_modules');
         if (!fs.existsSync(spellcraftModulesPath)) {
-            // Ensure the aggregate file is empty if no modules found
-            fs.writeFileSync(aggregateModuleFile, '{}', 'utf-8');
-            return [];
+            return { registeredFunctions: [], magicContent: [] };
         }
 
         const spellcraftConfig = thisPackage.config || thisPackage.spellcraft; // Allow 'spellcraft' key too
 
         if (!!spellcraftConfig?.spellcraft_module_default_name) {
             console.log("[-] This package is a SpellCraft module. Skipping directory-based module import.");
-            return []
+            return { registeredFunctions: [], magicContent: [] };
         }
 
         const jsModuleFiles = fs.readdirSync(spellcraftModulesPath)
             .filter(f => f.endsWith('.js')) // Simpler check for .js files
             .map(f => path.join(spellcraftModulesPath, f));
 
-        return this.loadModulesFromFileList(jsModuleFiles, aggregateModuleFile);
+        return this.loadModulesFromFileList(jsModuleFiles);
     }
 
 
@@ -479,7 +495,7 @@ exports.SpellFrame = class SpellFrame {
         
         return Object.entries(packages).map(([npmPackageName, moduleKey]) => {
             return this.loadModuleByName(moduleKey, npmPackageName);
-        }).filter(Boolean); // Filter out any undefined results if a module fails to load
+        }); // Filter out any undefined results if a module fails to load
     }
 
     /**
@@ -487,7 +503,7 @@ exports.SpellFrame = class SpellFrame {
      * @private
      * @param {string} moduleKey - The key (alias) under which the module is registered.
      * @param {string} npmPackageName - The actual npm package name.
-     * @returns {string|false} The moduleKey if successful, null otherwise.
+     * @returns {string|false} The moduleKey if successful, false otherwise.
      */
     loadModuleByName(moduleKey, npmPackageName) {
         const packageJsonPath = path.join(baseDir, 'node_modules', npmPackageName, 'package.json');
@@ -505,14 +521,16 @@ exports.SpellFrame = class SpellFrame {
         }
 
         if (!packageConfig.main) {
-            console.warn(`[!] 'main' field missing in package.json for module '${moduleKey}' (package: ${npmPackageName}). Skipping JS function loading.`);
+            console.warn(`[!] 'main' field missing in package.json for module '${moduleKey}' (package: ${npmPackageName}). Skipping JS function loading.`.red);
         } else {
             const jsMainFilePath = path.resolve(baseDir, 'node_modules', npmPackageName, packageConfig.main);
             if (fs.existsSync(jsMainFilePath)) {
                 const { functions } = this.loadFunctionsFromFile(jsMainFilePath);
-                console.log(`[+] Imported JavaScript native [${functions.join(', ')}] into module '${moduleKey}'`);
+                if (functions.length > 0) {
+                    console.log(`[+] Imported JavaScript native [${functions.join(', ').cyan}] from module ${moduleKey.green}`);
+                }
             } else {
-                console.warn(`[!] Main JS file '${jsMainFilePath}' not found for module '${moduleKey}'. Skipping JS function loading.`);
+                console.warn(`[!] Main JS file '${jsMainFilePath.red}' not found for module '${moduleKey.red}'. Skipping JS function loading.`);
             }
         }
         
@@ -541,13 +559,15 @@ exports.SpellFrame = class SpellFrame {
                 // Ensure the target directory exists
                 fs.mkdirSync(path.dirname(targetLibsonnetPath), { recursive: true });
                 fs.copyFileSync(sourceLibsonnetPath, targetLibsonnetPath);
-                console.log(`[+] Copied libsonnet module for '${moduleKey}'`);
+                
+                console.log(`[+] Linked libsonnet module for ${npmPackageName == '..' ? 'this package'.blue : npmPackageName.green} as modules.${moduleKey.green}`);
             } catch (e) {
                 console.warn(`[!] Failed to copy libsonnet module for '${moduleKey}': ${e.message}`);
             }
         } else {
             // console.log(`[+] No .libsonnet module found for '${moduleKey}' at expected paths.`);
         }
+
         return moduleKey;
     }
 
@@ -560,14 +580,9 @@ exports.SpellFrame = class SpellFrame {
      * @returns {{registeredFunctions: string[], magicContent: string[]}}
      *          An object containing lists of registered function names and the Jsonnet "magic" import strings.
      */
-    loadModulesFromFileList(jsModuleFiles, aggregateModuleFile) {
+    loadModulesFromFileList(jsModuleFiles) {
         let allRegisteredFunctions = [];
         let allMagicContent = [];
-
-        if (jsModuleFiles.length < 1) {
-            fs.writeFileSync(aggregateModuleFile, '{}', 'utf-8'); // Write empty object if no modules
-            return { registeredFunctions: [], magicContent: [] };
-        }
 
         jsModuleFiles.forEach(file => {
             try {
@@ -578,24 +593,6 @@ exports.SpellFrame = class SpellFrame {
                 console.warn(`[!] Failed to load functions from module ${file}: ${e.message}`);
             }
         });
-
-        const aggregateFileDir = path.dirname(aggregateModuleFile);
-        if (!fs.existsSync(aggregateFileDir)) {
-            fs.mkdirSync(aggregateFileDir, { recursive: true });
-        }
-        
-        fs.writeFileSync(aggregateModuleFile, `{\n${magicContent.join(",\n")}\n}`, 'utf-8');
-
-        if (jsModuleFiles.length > 0) {
-            console.log(`[+] Processed ${jsModuleFiles.length} JS module file(s) for native functions.`);
-        }
-        if (allRegisteredFunctions.length > 0) {
-             console.log(`[+] Registered ${allRegisteredFunctions.length} native function(s): [ ${allRegisteredFunctions.sort().join(', ')} ]`);
-        }
-        if (moduleImportsString || allMagicContent.length > 0) {
-            console.log(`[+] Aggregated modules written to '${path.basename(aggregateModuleFile)}'`);
-        }
-
 
         return { registeredFunctions: allRegisteredFunctions, magicContent: allMagicContent };
     }
@@ -725,7 +722,7 @@ exports.SpellFrame = class SpellFrame {
                     try {
                         const processedContent = handlerFn(fileContent);
                         fs.writeFileSync(outputFilePath, processedContent, 'utf-8');
-                        console.log('  -> ' + path.basename(outputFilePath));
+                        console.log(`  -> ${path.basename(outputFilePath).green}`);
                     } catch (handlerError) {
                          console.error(`  [!] Error processing or writing file ${filename}: ${handlerError.message}`);
                          // Optionally re-throw or collect errors

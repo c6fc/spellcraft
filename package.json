@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@colors/colors": "^1.6.0",
     "@hanazuki/node-jsonnet": "^0.4.2",
     "ini": "^5.0.0",
     "js-yaml": "^4.1.0",
@@ -7,7 +8,7 @@
   },
   "name": "@c6fc/spellcraft",
   "description": "Extensible JSonnet CLI platform",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "main": "src/index.js",
   "directories": {
     "lib": "lib"

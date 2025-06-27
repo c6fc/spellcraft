@@ -11,6 +11,7 @@
 'use strict';
 
 const yargs = require('yargs');
+const colors = require('@colors/colors');
 const { hideBin } = require('yargs/helpers');
 const { SpellFrame } = require('../src/index.js');
 
@@ -82,12 +83,11 @@ const spellframe = new SpellFrame();
             async (argv) => { // No JSDoc for internal handler
                 try {
                     await sfInstance.init();
-                    console.log(`[+] Rendering configuration from: ${argv.filename}`);
                     await sfInstance.render(argv.filename);
                     await sfInstance.write();
                     console.log("[+] Generation complete.");
                 } catch (error) {
-                    console.error(`[!] Error during generation: ${error.message}`);
+                    console.error(`[!] Error during generation: ${error.message.red}`);
                     process.exit(1);
                 }
             })
@@ -105,14 +105,9 @@ const spellframe = new SpellFrame();
                         default: undefined,
                     });
             },
-            async (argv) => { // No JSDoc for internal handler
-                try {
-                    await sfInstance.importSpellCraftModuleFromNpm(argv.npmPackage, argv.name);
-                    console.log(`[+] Module '${argv.npmPackage}' ${argv.name ? `(aliased as ${argv.name}) ` : ''}linked successfully.`);
-                } catch (error) {
-                    console.error(`[!] Error importing module: ${error.message}`);
-                    process.exit(1);
-                }
+            async (argv) => {
+                await sfInstance.importSpellCraftModuleFromNpm(argv.npmPackage, argv.name);
+                console.log(`[+] Module '${argv.npmPackage.green}' ${argv.name ? `(aliased as ${argv.name.green})` : ''} linked successfully.`);
             });
 
         // No JSDoc for CLI extensions loop if considered internal detail
