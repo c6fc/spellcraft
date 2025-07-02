@@ -3,3 +3,4 @@ render
 lib/modules
 modules/**
 docs
+**.bak
