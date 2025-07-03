@@ -23,9 +23,10 @@ exports.SpellFrame = class SpellFrame {
 
     constructor(options = {}) {
         const defaults = {
-            renderPath: "./render",
-            modulePath: "./modules",
+            renderPath: "render",
+            spellcraftModuleRelativePath: ".spellcraft_linked_modules",
             cleanBeforeRender: true,
+            cleanModulesAfterRender: true,
             useDefaultFileHandlers: true
         };
 
@@ -42,26 +43,31 @@ exports.SpellFrame = class SpellFrame {
         this.lastRender = null;
         this.activePath = null;
         this.loadedModules = [];
-        this.modulePath = path.resolve(path.join(process.cwd(), this.modulePath));
         this.magicContent = {}; // { modulefile: [...snippets] }
         this.registeredFunctions = {}; // { modulefile: [...functionNames] }
 
         this.renderPath = path.resolve(this.currentPackagePath, this.renderPath);
-        this.modulePath = path.resolve(this.currentPackagePath, this.modulePath);
+        this.modulePath = path.resolve(this.currentPackagePath, this.spellcraftModuleRelativePath);
 
-        this.jsonnet = new Jsonnet()
-            .addJpath(path.join(__dirname, '../lib')) // For core SpellCraft libsonnet files
-            .addJpath(this.modulePath); // For dynamically generated module imports
+        this.jsonnet = new Jsonnet();
 
-        // Add built-in native functions
-        this.addNativeFunction("envvar", (name) => process.env[name] || false, "name");
-        this.addNativeFunction("path", () => this.activePath || process.cwd()); // Use activePath if available
+        this.addJpath(path.join(__dirname, '../lib')) // For core SpellCraft libsonnet files
+            .addJpath(path.join(this.modulePath)) // For dynamically generated module imports
+            .addNativeFunction("envvar", (name) => process.env[name] || false, "name")
+            .addNativeFunction("path", () => this.activePath || process.cwd()) // Use activePath if available
+            .cleanModulePath();
 
+        this.loadedModules = this.loadModulesFromPackageList();
+        this.loadModulesFromModuleDirectory();
+
+        return this;
+    }
+
+    cleanModulePath() {
         if (!fs.existsSync(this.modulePath)) {
             fs.mkdirSync(this.modulePath, { recursive: true });
         }
 
-        // Clean up the modules on init
         try {
             fs.readdirSync(this.modulePath)
                 .map(e => path.join(this.modulePath, e))
@@ -70,9 +76,6 @@ exports.SpellFrame = class SpellFrame {
         } catch (e) {
             throw new Error(`[!] Could not create/clean up temporary module folder ${path.dirname(this.modulePath).green}: ${e.message.red}`);
         }
-
-        this.loadedModules = this.loadModulesFromPackageList();
-        this.loadModulesFromModuleDirectory();
 
         return this;
     }
@@ -126,7 +129,8 @@ exports.SpellFrame = class SpellFrame {
     }
 
     addJpath(jpath) {
-        this.jsonnet = this.jsonnet.addJpath(jpath);
+        console.log(`[*] Adding Jpath ${jpath}`);
+        this.jsonnet.addJpath(jpath);
         return this;
     }
 
@@ -266,7 +270,7 @@ exports.SpellFrame = class SpellFrame {
 
         jsModuleFiles.forEach(file => {
             this.loadFunctionsFromFile(file, as);
-            console.log(`[+] Loaded [${this.registeredFunctions.join(', ').cyan}] from ${path.basename(file).green} into module.${as.green}`);
+            console.log(`[+] Loaded [${this.registeredFunctions[as].join(', ').cyan}] from ${path.basename(file).green} into modules.${as.green}`);
         });
 
         return this;
@@ -275,12 +279,10 @@ exports.SpellFrame = class SpellFrame {
     loadModulesFromModuleDirectory() {
         const spellcraftModulesPath = path.join(this.currentPackagePath, 'spellcraft_modules');
         if (!fs.existsSync(spellcraftModulesPath)) {
-            return { registeredFunctions: [], magicContent: [] };
+            return this;
         }
 
-        const spellcraftConfig = thisPackage.config || thisPackage.spellcraft; // Allow 'spellcraft' key too
-
-        if (!!spellcraftConfig?.spellcraft_module_default_name) {
+        if (!!this.currentPackage?.config?.spellcraft_module_default_name) {
             console.log("[-] This package is a SpellCraft module. Skipping directory-based module import.");
             return { registeredFunctions: [], magicContent: [] };
         }
@@ -308,11 +310,10 @@ exports.SpellFrame = class SpellFrame {
             console.log(`[+] Successfully installed ${npmPackage.blue}.`);
         }
 
-        const importModuleConfig = this.getModulePackage(npmPackage).config;
+        const importModuleConfig = this.getModulePackage(`${npmPackage}/package.json`).config;
         const currentPackageConfig = this.currentPackage.config;
 
         if (!name && !!!importModuleConfig?.spellcraft_module_default_name) {
-            // console.log("Package config:", moduleJson);
             throw new Error(`[!] No import name specified for ${npmPackage.blue}, and it has no 'spellcraft_module_default_name' in its package.json config.`.red);
         }
 
@@ -360,13 +361,32 @@ exports.SpellFrame = class SpellFrame {
 
         this.activePath = path.dirname(absoluteFilePath); // Set active path for relative 'path()' calls
 
+        this.magicContent.modules.push(this.loadedModules.flatMap(e => {
+            return `\t${e}:: import '${e}.libsonnet'`;
+        }));
+
+        if (this.registeredFunctions.modules.length > 0) {
+            fs.writeFileSync(path.join(this.modulePath, `modules`), `{\n${this.magicContent.modules.join(",\n")}\n}`, 'utf-8');
+            console.log(`[+] Registered native functions [${this.registeredFunctions.modules.join(', ').cyan}] to modules.${'modules'.green}`);
+        }
+
+        delete this.magicContent.modules;
+
         Object.keys(this.magicContent).forEach(e => {
-            fs.writeFileSync(path.join(this.modulePath, e), `{\n${this.magicContent[e].join(",\n")}\n}`, 'utf-8');
+            fs.appendFileSync(path.join(this.modulePath, `${e}.libsonnet`), ` + {\n${this.magicContent[e].join(",\n")}\n}`, 'utf-8');
             console.log(`[+] Registered native functions [${this.registeredFunctions[e].join(', ').cyan}] to modules.${e.green} `);
         });
-        
+
         console.log(`[+] Evaluating Jsonnet file ${path.basename(absoluteFilePath).green}`);
         this.lastRender = JSON.parse(await this.jsonnet.evaluateFile(absoluteFilePath));
+
+        if (this.cleanModulesAfterRender) {
+            this.cleanModulePath();
+
+            fs.rmdirSync(this.modulePath);
+        } else {
+            console.log(`[*] Leaving ${this.spellcraftModuleRelativePath} in place.`.magenta);
+        }
         
         return this.lastRender;
     }

@@ -78,18 +78,26 @@ const spellframe = new SpellFrame();
                     describe: 'Jsonnet configuration file to consume',
                     type: 'string',
                     demandOption: true,
+                }).option('skip-module-cleanup', {
+                    alias: 's',
+                    type: 'boolean',
+                    description: 'Leave temporary modules intact after rendering'
                 });
             },
             async (argv) => { // No JSDoc for internal handler
-                try {
+                // try {
+                    if (argv['s']) {
+                        sfInstance.cleanModulesAfterRender = false;
+                    }
+
                     await sfInstance.init();
                     await sfInstance.render(argv.filename);
                     await sfInstance.write();
                     console.log("[+] Generation complete.");
-                } catch (error) {
+                /*} catch (error) {
                     console.error(`[!] Error during generation: ${error.message.red}`);
                     process.exit(1);
-                }
+                }*/
             })
 
             .command("importModule <npmPackage> [name]", "Configures the current project to use a SpellCraft plugin as an import", (yargsInstance) => {
