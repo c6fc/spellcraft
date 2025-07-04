@@ -1,4 +1,3 @@
-// ./src/index.js
 'use strict';
 
 const fs = require("fs");
@@ -129,7 +128,7 @@ exports.SpellFrame = class SpellFrame {
     }
 
     addJpath(jpath) {
-        console.log(`[*] Adding Jpath ${jpath}`);
+        // console.log(`[*] Adding Jpath ${jpath}`);
         this.jsonnet.addJpath(jpath);
         return this;
     }

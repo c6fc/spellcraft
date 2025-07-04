@@ -115,7 +115,7 @@ const spellframe = new SpellFrame();
             },
             async (argv) => {
                 await sfInstance.importSpellCraftModuleFromNpm(argv.npmPackage, argv.name);
-                console.log(`[+] Module '${argv.npmPackage.green}' ${argv.name ? `(aliased as ${argv.name.green})` : ''} linked successfully.`);
+                console.log(`[+] Module '${argv.npmPackage.green}' ${argv.name ? `(aliased as ${argv.name.green}) ` : ''}linked successfully.`);
             });
 
         // No JSDoc for CLI extensions loop if considered internal detail
