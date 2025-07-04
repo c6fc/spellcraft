@@ -129,8 +129,8 @@ $ npx spellcraft --help
 Commands:
   spellcraft generate <filename>                Generates files from a configuration
   spellcraft importModule <npmPackage> [name]   Configures the current project to use a SpellCraft module
-  spellcraft aws-identity                       Display the AWS IAM identity of the SpellCraft context
-  spellcraft aws-exportcredentials              Export the current credentials as environment variables
+  spellcraft aws-identity                       Display the AWS IAM identity of the SpellCraft context	# Added by a module
+  spellcraft aws-exportcredentials              Export the current credentials as environment variables	# Added by a module
 ```
 
 ## Programmatic Usage (API)
@@ -139,10 +139,9 @@ For more advanced workflows, such as integration into larger automation scripts,
 
 The typical flow is:
 1.  Instantiate `SpellFrame`.
-2.  Load necessary modules.
-3.  (Optional) Run module initializers with `init()`.
-4.  Render the Jsonnet file with `render()`.
-5.  Write the resulting object to disk with `write()`.
+2.  Run module initializers with `init()`.
+3.  Render the Jsonnet file with `render()`.
+4.  Write the resulting object to disk with `write()`.
 
 ```javascript
 // my-automation-script.js
@@ -157,30 +156,22 @@ const frame = new SpellFrame({
 });
 
 (async () => {
-  try {
-    // 2. Load modules programmatically (this assumes they are in package.json)
-    // This loads modules listed in 'spellcraft_modules/packages.json'
-    // and from the local 'spellcraft_modules/' directory.
-    // frame.loadModuleByName('my-module-key', 'my-npm-package');
-
-    // 3. Initialize modules (if any modules registered an init function)
+    
+    // 2. Initialize modules before rendering.
     await frame.init();
 
-    // 4. Render the master Jsonnet file
+    // 3. Render the master Jsonnet file
     const manifest = await frame.render(path.resolve('./manifest.jsonnet'));
 
     // The result is available in memory
     console.log('Rendered Manifest:', JSON.stringify(manifest, null, 2));
 
-    // 5. Write the manifest object to the filesystem
-    frame.write(manifest);
+    // 4. Write the manifest object to the filesystem. Defaults to the contents of
+    // the most recent 'render'.
+    frame.write();
 
     console.log('Successfully wrote files to the dist/ directory!');
 
-  } catch (error) {
-    console.error('An error occurred during the SpellCraft process:', error);
-    process.exit(1);
-  }
 })();
 ```
 
