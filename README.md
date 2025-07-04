@@ -175,6 +175,19 @@ const frame = new SpellFrame({
 })();
 ```
 
-## Creating Your Own Spells (Modules)
+## Top-tier spellframe extensions by SpellCraft authors:
+
+It can be hard to conceptualize what SpellCraft is capable of by just looking at the engine itself. Here are a set of SpellCraft modules that demonstrate the extensibility of the engine:
+
+|Package|Description|
+|---|---|
+|[**@c6fc/spellcraft-aws-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth)|Exposes the full power of the AWS SDK for JavaScript to your SpellFrames, including native support for common AWS credential sources and role-chaining.|
+|[**@c6fc/spellcraft-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-terraform)|Brings Terraform into your SpellCraft CLI and SpellFrames, allowing you to directly deploy the results of your Spells.|
+|[**@c6fc/spellcraft-packer**](https://www.npmjs.com/package/@c6fc/spellcraft-packer)|Brings Packer into SpellCraft CLI and SpellFrames, allowing you to run builds against the results of your Spells.|
+|[**@c6fc/spellcraft-aws-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-terraform)|Contains shortcuts for common use-cases when using Terraform to deploy configurations to AWS. Including backend bootstrapping, artifact repositories, and remote state access. It also demonstrates how modules can build on the capabilities of other modules.|
+|[**@c6fc/spellcraft-aws-s3**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-s3)|A simple but powerful module for creating AWS S3 buckets. It uses secure defaults, exposes common use-cases as optional 'types', and grants extensive control with minimal code.|
+
+
+## Creating Your Own Modules
 
 When you're ready to start writing your own modules and unleashing the true power of SpellCraft, check out **[create-spellcraft-module](https://www.npmjs.com/package/@c6fc/spellcraft)**
