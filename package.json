@@ -8,7 +8,7 @@
   },
   "name": "@c6fc/spellcraft",
   "description": "Extensible JSonnet CLI platform",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "main": "src/index.js",
   "directories": {
     "lib": "lib"

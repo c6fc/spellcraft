@@ -294,11 +294,20 @@ exports.SpellFrame = class SpellFrame {
     }
 
     async importSpellCraftModuleFromNpm(npmPackage, name = false) {
-        if (!fs.existsSync(this.getModulePackagePath(npmPackage))) {
+
+        let packagePath;
+
+        try {
+            packagePath = fs.existsSync(this.getModulePackagePath(npmPackage));
+        } catch (e) {
+            packagePath = false;
+        }
+
+        if (!packagePath) {
             console.log(`[*] Attempting to install ${npmPackage.blue}...`);
             
             const install = spawnSync(`npm`, ['install', '--save', npmPackage], {
-                cwd: baseDir,
+                cwd: this.currentPackagePath,
                 stdio: 'inherit'
             });
 
