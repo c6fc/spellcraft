@@ -100,24 +100,6 @@ const spellframe = new SpellFrame();
                 }*/
             })
 
-            .command("importModule <npmPackage> [name]", "Configures the current project to use a SpellCraft plugin as an import", (yargsInstance) => {
-                return yargsInstance
-                    .positional('npmPackage', {
-                        describe: 'The NPM package name of a SpellCraft Plugin to import',
-                        type: 'string',
-                        demandOption: true,
-                    })
-                    .positional('name', {
-                        describe: 'Optional alias name for the module in SpellCraft',
-                        type: 'string',
-                        default: undefined,
-                    });
-            },
-            async (argv) => {
-                await sfInstance.importSpellCraftModuleFromNpm(argv.npmPackage, argv.name);
-                console.log(`[+] Module '${argv.npmPackage.green}' ${argv.name ? `(aliased as ${argv.name.green}) ` : ''}linked successfully.`);
-            });
-
         // No JSDoc for CLI extensions loop if considered internal detail
         if (sfInstance.cliExtensions && sfInstance.cliExtensions.length > 0) {
             sfInstance.cliExtensions.forEach((extensionFn) => {
