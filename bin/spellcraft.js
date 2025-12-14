@@ -1,46 +1,16 @@
 #! /usr/bin/env node
 
-/**
- * @fileOverview SpellCraft CLI tool.
- * This script provides a command-line interface for interacting with the SpellFrame
- * rendering engine. It allows users to generate configurations from Jsonnet files
- * and manage SpellCraft modules.
- * @module spellcraft-cli
- */
-
 'use strict';
 
 const yargs = require('yargs');
 const colors = require('@colors/colors');
 const { hideBin } = require('yargs/helpers');
 const { SpellFrame } = require('../src/index.js');
+const DocGenerator = require('../src/doc-generator');
 
 const spellframe = new SpellFrame();
 
-// --- JSDoc Blocks for CLI Commands ---
-// These blocks define the commands for JSDoc.
-// They are not directly attached to yargs code but describe the CLI's public interface.
-
-/**
- * Generates files from a Jsonnet configuration.
- * This command processes a specified Jsonnet configuration file using the SpellFrame engine,
- * renders the output, and writes the resulting files to the configured directory.
- *
- * **Usage:** `spellcraft generate <filename>`
- *
- * @function generate
- * @name module:spellcraft-cli.generate
- * @param {object} argv - The arguments object provided by yargs.
- * @param {string} argv.filename The path to the Jsonnet configuration file to consume. (Required)
- *
- * @example
- * spellcraft generate ./myconfig.jsonnet
- */
-
-// --- End of JSDoc Blocks for CLI Commands ---
-
 (async () => {
-    // No JSDoc for setupCli as it's an internal helper
     function setupCli(sfInstance) {
         let cli = yargs(hideBin(process.argv))
             .usage("Syntax: $0 <command> [options]")
@@ -50,6 +20,12 @@ const spellframe = new SpellFrame();
                 return yargsInstance;
             }, (argv) => {
                 console.log("[~] That's too arcane. (Unrecognized command)");
+            })
+
+            .command("doc", "Generates Markdown documentation for the current module and updates README.md", () => {}, 
+            (argv) => {
+                const generator = new DocGenerator(process.cwd());
+                generator.generate();
             })
 
             .command("generate <filename>", "Generates files from a configuration", (yargsInstance) => {
@@ -63,23 +39,17 @@ const spellframe = new SpellFrame();
                     description: 'Leave temporary modules intact after rendering'
                 });
             },
-            async (argv) => { // No JSDoc for internal handler
-                // try {
-                    if (argv['s']) {
-                        sfInstance.cleanModulesAfterRender = false;
-                    }
+            async (argv) => {
+                if (argv['s']) {
+                    sfInstance.cleanModulesAfterRender = false;
+                }
 
-                    await sfInstance.init();
-                    await sfInstance.render(argv.filename);
-                    await sfInstance.write();
-                    console.log("[+] Generation complete.");
-                /*} catch (error) {
-                    console.error(`[!] Error during generation: ${error.message.red}`);
-                    process.exit(1);
-                }*/
+                await sfInstance.init();
+                await sfInstance.render(argv.filename);
+                await sfInstance.write();
+                console.log("[+] Generation complete.");
             })
 
-        // No JSDoc for CLI extensions loop if considered internal detail
         if (sfInstance.cliExtensions && sfInstance.cliExtensions.length > 0) {
             sfInstance.cliExtensions.forEach((extensionFn) => {
                 if (typeof extensionFn === 'function') {

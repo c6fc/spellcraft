@@ -133,11 +133,6 @@ exports.SpellFrame = class SpellFrame {
         }
     }
 
-    /**
-     * REFACTOR: Scans the project's package.json for dependencies.
-     * If a dependency has a 'spellcraft' key in its package.json, 
-     * load its JS entrypoint and register native functions safely.
-     */
     loadPluginsFromDependencies() {
         const packageJsonPath = path.join(baseDir, 'package.json');
         if (!fs.existsSync(packageJsonPath)) return;
@@ -175,11 +170,6 @@ exports.SpellFrame = class SpellFrame {
         });
     }
 
-    /**
-     * Scans the local 'spellcraft_modules' directory.
-     * 1. Registers JS exports as native functions (prefixed with 'local_<filename>_').
-     * 2. Generates a .spellcraft/modules.libsonnet file to allow `import 'modules'`.
-     */
     loadLocalMagicModules() {
         const localModulesDir = path.join(baseDir, 'spellcraft_modules');
         const generatedDir = path.join(baseDir, '.spellcraft');
@@ -251,11 +241,6 @@ exports.SpellFrame = class SpellFrame {
         fs.writeFileSync(aggregateFile, finalContent, 'utf-8');
     }
 
-    /**
-     * REFACTOR: Loads a specific plugin JS file.
-     * Namespaces native functions using the package name to prevent collisions.
-     * e.g., @c6fc/spellcraft-aws-auth exports 'aws' -> registered as '@c6fc/spellcraft-aws-auth:aws'
-     */
     loadPlugin(packageName, jsMainPath) {
         if (!jsMainPath || !fs.existsSync(jsMainPath)) return;
 
@@ -328,12 +313,7 @@ exports.SpellFrame = class SpellFrame {
         
         return this.lastRender;
     }
-
-    // Removed: importSpellCraftModuleFromNpm
-    // Removed: loadModulesFromModuleDirectory
-    // Removed: loadModulesFromPackageList
-    // Removed: loadModuleByName (file copier)
-
+    
     write(filesToWrite = this.lastRender) {
         if (!filesToWrite || typeof filesToWrite !== 'object') return this;
 
