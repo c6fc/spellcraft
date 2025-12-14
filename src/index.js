@@ -64,7 +64,8 @@ exports.SpellFrame = class SpellFrame {
         this.jsonnet = new Jsonnet()
             .addJpath(path.join(__dirname, '../lib'))
             // REFACTOR: Look in the local project's node_modules for explicit imports
-            .addJpath(path.join(baseDir, 'node_modules')); 
+            .addJpath(path.join(baseDir, 'node_modules'))
+            .addJpath(path.join(baseDir, '.spellcraft'));
 
         // Built-in native functions
         this.addNativeFunction("envvar", (name) => process.env[name] || false, "name");
@@ -72,6 +73,9 @@ exports.SpellFrame = class SpellFrame {
 
         // REFACTOR: Automatically find and register plugins from package.json
         this.loadPluginsFromDependencies();
+
+        // 2. Load Local Magic Modules (Rapid Prototyping Mode)
+        this.loadLocalMagicModules();
     }
 
     _generateCacheKey(functionName, args) {
@@ -144,21 +148,107 @@ exports.SpellFrame = class SpellFrame {
         } catch (e) { return; }
 
         const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+        
+        // Create a require function that operates as if it's inside the user's project
+        const userProjectRequire = require('module').createRequire(packageJsonPath);
 
         Object.keys(deps).forEach(depName => {
             try {
-                // Resolve the package.json of the dependency
-                const depPath = path.dirname(require.resolve(`${depName}/package.json`, { paths: [baseDir] }));
-                const depPkg = require(`${depName}/package.json`);
+                // 1. Find the path to the dependency's package.json using the USER'S context
+                const depPackageJsonPath = userProjectRequire.resolve(`${depName}/package.json`);
+                
+                // 2. Load that package.json using the absolute path
+                const depPkg = require(depPackageJsonPath);
+                const depDir = path.dirname(depPackageJsonPath);
 
-                // Only load if it marks itself as a spellcraft module
+                // 3. Check for SpellCraft metadata
                 if (depPkg.spellcraft || depPkg.keywords?.includes("spellcraft-module")) {
-                    this.loadPlugin(depName, depPkg.main ? path.join(depPath, depPkg.main) : null);
+                    const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
+                    
+                    // 4. Load the plugin using the calculated absolute path
+                    this.loadPlugin(depName, jsMainPath);
                 }
             } catch (e) {
                 // Dependency might not be installed or resolvable, skip quietly
+                console.warn(`Debug: Could not load potential plugin ${depName}: ${e.message}`);
             }
         });
+    }
+
+    /**
+     * Scans the local 'spellcraft_modules' directory.
+     * 1. Registers JS exports as native functions (prefixed with 'local_<filename>_').
+     * 2. Generates a .spellcraft/modules.libsonnet file to allow `import 'modules'`.
+     */
+    loadLocalMagicModules() {
+        const localModulesDir = path.join(baseDir, 'spellcraft_modules');
+        const generatedDir = path.join(baseDir, '.spellcraft');
+        const aggregateFile = path.join(generatedDir, 'modules');
+
+        if (!fs.existsSync(localModulesDir)) {
+            // Clean up if it exists so imports fail gracefully if folder is deleted
+            if(fs.existsSync(aggregateFile)) fs.unlinkSync(aggregateFile);
+            return;
+        }
+
+        // Ensure hidden directory exists
+        if (!fs.existsSync(generatedDir)) fs.mkdirSync(generatedDir, { recursive: true });
+
+        const jsFiles = fs.readdirSync(localModulesDir).filter(f => f.endsWith('.js'));
+        
+        let jsonnetContentParts = [];
+
+        jsFiles.forEach(file => {
+            const moduleName = path.basename(file, '.js');
+            const fullPath = path.join(localModulesDir, file);
+            
+            let moduleExports;
+            try {
+                // Cache busting for dev speed
+                delete require.cache[require.resolve(fullPath)];
+                moduleExports = require(fullPath);
+            } catch (e) {
+                console.warn(`[!] Error loading local module ${file}: ${e.message}`);
+                return;
+            }
+
+            let fileMethods = [];
+
+            Object.keys(moduleExports).forEach(funcName => {
+                if (funcName === '_spellcraft_metadata') return; // Skip metadata
+
+                let func, params;
+                // Handle [func, "arg1", "arg2"] syntax or plain function
+                if (Array.isArray(moduleExports[funcName])) {
+                    [func, ...params] = moduleExports[funcName];
+                } else if (typeof moduleExports[funcName] === 'function') {
+                    func = moduleExports[funcName];
+                    // You'll need the getFunctionParameterList helper from before
+                    params = getFunctionParameterList(func); 
+                } else {
+                    return;
+                }
+
+                // Register with a unique local prefix
+                const uniqueId = `local_${moduleName}_${funcName}`;
+                this.addNativeFunction(uniqueId, func, ...params);
+
+                // Create the Jsonnet wrapper string
+                // e.g. myFunc(a, b):: std.native("local_utils_myFunc")(a, b)
+                const paramStr = params.join(", ");
+                fileMethods.push(`    ${funcName}(${paramStr}):: std.native("${uniqueId}")(${paramStr})`);
+            });
+
+            console.log(`[+] Loaded [${Object.keys(moduleExports).join(", ")}] from [${file}].`);
+
+            if (fileMethods.length > 0) {
+                jsonnetContentParts.push(`  ${moduleName}: {\n${fileMethods.join(",\n")}\n  }`);
+            }
+        });
+
+        // Generate the file
+        const finalContent = "{\n" + jsonnetContentParts.join(",\n") + "\n}";
+        fs.writeFileSync(aggregateFile, finalContent, 'utf-8');
     }
 
     /**

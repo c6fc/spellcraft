@@ -37,27 +37,6 @@ const spellframe = new SpellFrame();
  * spellcraft generate ./myconfig.jsonnet
  */
 
-/**
- * Links an npm package as a SpellCraft module for the current project.
- * This command installs the specified npm package (if not already present) and
- * registers it within the project's SpellCraft module configuration, making its
- * functionalities available during the rendering process.
- *
- * **Usage:** `spellcraft importModule <npmPackage> [name]`
- *
- * @function importModule
- * @name module:spellcraft-cli.importModule
- * @param {object} argv - The arguments object provided by yargs.
- * @param {string} argv.npmPackage The NPM package name of the SpellCraft Plugin to import. (Required)
- * @param {string} [argv.name] An optional alias name to use for this module within SpellCraft.
- *                             If not provided, a default name from the package may be used.
- *
- * @example
- * spellcraft importModule my-spellcraft-enhancer
- * @example
- * spellcraft importModule @my-scope/spellcraft-utils customUtils
- */
-
 // --- End of JSDoc Blocks for CLI Commands ---
 
 (async () => {

@@ -9,8 +9,7 @@
     "source": {
         "include": [
             "src/",
-            "bin/",
-            "lib/"
+            "bin/"
         ],
         "includePattern": ".",
         "excludePattern": "\\.bak$"
