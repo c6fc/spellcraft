@@ -60,6 +60,9 @@ exports.SpellFrame = class SpellFrame {
         this.functionContext = {};
         this.lastRender = null;
         this.activePath = null;
+        this.visitedPlugins = new Set();
+        this.loadedPlugins = new Map();
+        this.isInitialized = false;
 
         this.jsonnet = new Jsonnet()
             .addJpath(path.join(__dirname, '../lib'))
@@ -73,6 +76,8 @@ exports.SpellFrame = class SpellFrame {
 
         // REFACTOR: Automatically find and register plugins from package.json
         this.loadPluginsFromDependencies();
+        this.loadPluginsRecursively(baseDir);
+        this.validatePluginRequirements();
 
         // 2. Load Local Magic Modules (Rapid Prototyping Mode)
         this.loadLocalMagicModules();
@@ -117,20 +122,27 @@ exports.SpellFrame = class SpellFrame {
                 this.addFileTypeHandler(pattern, handler);
             });
         }
+
         if (metadata.cliExtensions) {
             this.cliExtensions.push(...(Array.isArray(metadata.cliExtensions) ? metadata.cliExtensions : [metadata.cliExtensions]));
         }
-        if (metadata.initFn) {
-            this.initFn.push(...(Array.isArray(metadata.initFn) ? metadata.initFn : [metadata.initFn]));
+
+        if (metadata.init) {
+            this.initFn.push(...(Array.isArray(metadata.init) ? metadata.init : [metadata.init]));
         }
+
         Object.assign(this.functionContext, metadata.functionContext || {});
         return this;
     }
 
     async init() {
+        if (this.isInitialized) return;
+
         for (const step of this.initFn) {
             await step.call();
         }
+
+        this.isInitialized = true;
     }
 
     loadPluginsFromDependencies() {
@@ -244,6 +256,10 @@ exports.SpellFrame = class SpellFrame {
     loadPlugin(packageName, jsMainPath) {
         if (!jsMainPath || !fs.existsSync(jsMainPath)) return;
 
+        if (this.loadedPlugins.has(packageName)) {
+            return;
+        }
+
         let moduleExports;
         try {
             moduleExports = require(jsMainPath);
@@ -254,6 +270,11 @@ exports.SpellFrame = class SpellFrame {
 
         if (moduleExports._spellcraft_metadata) {
             this.extendWithModuleMetadata(moduleExports._spellcraft_metadata);
+
+            this.loadedPlugins.set(packageName, {
+                name: packageName,
+                requires: moduleExports._spellcraft_metadata.requires || []
+            });
         }
 
         Object.keys(moduleExports).forEach(key => {
@@ -279,7 +300,63 @@ exports.SpellFrame = class SpellFrame {
         });
     }
 
+    loadPluginsRecursively(currentDir) {
+        const packageJsonPath = path.join(currentDir, 'package.json');
+        
+        // If we've already scanned this specific directory, stop (Circular Dep protection)
+        if (this.visitedPlugins.has(packageJsonPath)) return;
+        this.visitedPlugins.add(packageJsonPath);
+
+        if (!fs.existsSync(packageJsonPath)) return;
+
+        let pkg;
+        try {
+            pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+        } catch (e) { return; }
+
+        // Combine dependencies (devDeps are usually only relevant at the root, 
+        // but we scan both for completeness at the root level).
+        // For sub-dependencies, standard 'dependencies' is usually what matters.
+        const deps = { ...pkg.dependencies, ...(currentDir === baseDir ? pkg.devDependencies : {}) };
+
+        // Create a resolver anchored to the CURRENT directory.
+        // This is crucial: it tells Node "Find dependencies relative to THIS module",
+        // not relative to the root project.
+        const localResolver = require('module').createRequire(packageJsonPath);
+
+        Object.keys(deps).forEach(depName => {
+            try {
+                // 1. Resolve where this dependency actually lives on disk
+                const depManifestPath = localResolver.resolve(`${depName}/package.json`);
+                const depDir = path.dirname(depManifestPath);
+
+                // 2. Load its package.json
+                const depPkg = require(depManifestPath);
+
+                // 3. Check if it is a SpellCraft module
+                if (depPkg.spellcraft) {
+                    
+                    // A. Load the Plugin Logic
+                    const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
+                    this.loadPlugin(depPkg.name, jsMainPath);
+
+                    // B. Recurse!
+                    // Now scan *this* dependency's dependencies
+                    this.loadPluginsRecursively(depDir);
+                }
+            } catch (e) {
+                // Dependency might be optional or failed to resolve; skip gracefully
+                // console.warn(`Debug: Skipped ${depName} from ${currentDir}: ${e.message}`);
+            }
+        });
+    }
+
     async render(file) {
+
+        if (!this.isInitialized) {
+            await this.init();
+        }
+
         const absoluteFilePath = path.resolve(file);
         if (!fs.existsSync(absoluteFilePath)) {
             throw new Error(`SpellCraft Render Error: Input file ${absoluteFilePath} does not exist.`);
@@ -312,6 +389,22 @@ exports.SpellFrame = class SpellFrame {
         }
         
         return this.lastRender;
+    }
+
+    validatePluginRequirements() {
+        for (const [pluginName, data] of this.loadedPlugins.entries()) {
+            if (!data.requires || data.requires.length === 0) continue;
+
+            data.requires.forEach(req => {
+                if (!this.loadedPlugins.has(req)) {
+                    throw new Error(
+                        `[SpellCraft Dependency Error] The module '${pluginName}' requires '${req}', ` +
+                        `but '${req}' was not found or failed to load. \n` +
+                        `    -> Try running: npm install --save ${req}`
+                    );
+                }
+            });
+        }
     }
     
     write(filesToWrite = this.lastRender) {
