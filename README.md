@@ -147,6 +147,44 @@ const frame = new SpellFrame();
 })();
 ```
 
+## Lifecycle Events (EventEmitter)
+
+`SpellFrame` inherits from Node's built-in `EventEmitter`. This allows programmatic orchestrators and plugins to register hook listeners for lifecycle actions.
+
+### Lifecycles & Events
+
+- **`render`**: Emitted immediately after successful Jsonnet rendering.
+  - Parameter: `lastRender` (the evaluated object).
+- **`write`**: Emitted after files are written to the target directory.
+  - Parameter: `filesToWrite` (the written files object).
+- **`<plugin-namespace>:<function-name>`**: Emitted whenever an externally registered plugin function is invoked (e.g. `@c6fc/spellcraft-gcp-terraform:enableServices`).
+  - Parameter: `...args` (the arguments passed to the function).
+
+### Programmatic Hook Example
+
+```javascript
+const frame = new SpellFrame();
+
+// Register hooks
+frame.on('render', (output) => {
+    console.log('Finished rendering files:', Object.keys(output));
+});
+
+frame.on('@c6fc/spellcraft-gcp-auth:getCallerIdentity', () => {
+    console.log('Plugin was queried for GCP Identity');
+});
+
+await frame.init();
+await frame.render('./manifest.jsonnet');
+```
+
+### Asynchronous Event Resolution
+
+If you need event handlers to run sequentially and block further execution until they resolve (for instance, to call remote APIs before initiating a subsequent action), use:
+```javascript
+await frame.emitAsync('@your-org/your-plugin:your-custom-event', ...args);
+```
+
 ## Creating Modules
 
 A SpellCraft module is simply an NPM package with specific metadata. You can get a head-start with:

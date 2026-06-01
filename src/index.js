@@ -6,6 +6,8 @@ const yaml = require('js-yaml');
 const crypto = require('crypto');
 const { Jsonnet } = require("@hanazuki/node-jsonnet");
 
+const EventEmitter = require("events");
+
 const baseDir = process.cwd();
 
 const defaultFileTypeHandlers = {
@@ -43,8 +45,9 @@ function getFunctionParameterList(func) {
         .filter(param => param.length > 0);
 }
 
-exports.SpellFrame = class SpellFrame {
+exports.SpellFrame = class SpellFrame extends EventEmitter {
     constructor(options = {}) {
+        super();
         const defaults = {
             renderPath: "./render",
             cleanBeforeRender: true,
@@ -58,6 +61,7 @@ exports.SpellFrame = class SpellFrame {
         this.cliExtensions = [];
         this.fileTypeHandlers = (this.useDefaultFileHandlers) ? { ...defaultFileTypeHandlers } : {};
         this.functionContext = {};
+        this.functionContext.spellframe = this;
         this.lastRender = null;
         this.activePath = null;
         this.visitedPlugins = new Set();
@@ -97,6 +101,13 @@ exports.SpellFrame = class SpellFrame {
         return this;
     }
 
+    async emitAsync(event, ...args) {
+        const listeners = this.listeners(event);
+        for (const listener of listeners) {
+            await listener(...args);
+        }
+    }
+
     addNativeFunction(name, func, ...parameters) {
         this.jsonnet.nativeCallback(name, (...args) => {
             const key = this._generateCacheKey(name, args);
@@ -105,6 +116,7 @@ exports.SpellFrame = class SpellFrame {
             }
             const result = func.apply(this.functionContext, args);
             this._cache[key] = result;
+            this.emit(name, ...args);
             return result;
         }, ...parameters);
         return this;
@@ -139,7 +151,7 @@ exports.SpellFrame = class SpellFrame {
         if (this.isInitialized) return;
 
         for (const step of this.initFn) {
-            await step.call();
+            await step(this);
         }
 
         this.isInitialized = true;
@@ -155,7 +167,7 @@ exports.SpellFrame = class SpellFrame {
         } catch (e) { return; }
 
         const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-        
+
         // Create a require function that operates as if it's inside the user's project
         const userProjectRequire = require('module').createRequire(packageJsonPath);
 
@@ -163,7 +175,7 @@ exports.SpellFrame = class SpellFrame {
             try {
                 // 1. Find the path to the dependency's package.json using the USER'S context
                 const depPackageJsonPath = userProjectRequire.resolve(`${depName}/package.json`);
-                
+
                 // 2. Load that package.json using the absolute path
                 const depPkg = require(depPackageJsonPath);
                 const depDir = path.dirname(depPackageJsonPath);
@@ -171,7 +183,7 @@ exports.SpellFrame = class SpellFrame {
                 // 3. Check for SpellCraft metadata
                 if (depPkg.spellcraft || depPkg.keywords?.includes("spellcraft-module")) {
                     const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
-                    
+
                     // 4. Load the plugin using the calculated absolute path
                     this.loadPlugin(depName, jsMainPath);
                 }
@@ -189,7 +201,7 @@ exports.SpellFrame = class SpellFrame {
 
         if (!fs.existsSync(localModulesDir)) {
             // Clean up if it exists so imports fail gracefully if folder is deleted
-            if(fs.existsSync(aggregateFile)) fs.unlinkSync(aggregateFile);
+            if (fs.existsSync(aggregateFile)) fs.unlinkSync(aggregateFile);
             return;
         }
 
@@ -197,13 +209,13 @@ exports.SpellFrame = class SpellFrame {
         if (!fs.existsSync(generatedDir)) fs.mkdirSync(generatedDir, { recursive: true });
 
         const jsFiles = fs.readdirSync(localModulesDir).filter(f => f.endsWith('.js'));
-        
+
         let jsonnetContentParts = [];
 
         jsFiles.forEach(file => {
             const moduleName = path.basename(file, '.js');
             const fullPath = path.join(localModulesDir, file);
-            
+
             let moduleExports;
             try {
                 // Cache busting for dev speed
@@ -226,7 +238,7 @@ exports.SpellFrame = class SpellFrame {
                 } else if (typeof moduleExports[funcName] === 'function') {
                     func = moduleExports[funcName];
                     // You'll need the getFunctionParameterList helper from before
-                    params = getFunctionParameterList(func); 
+                    params = getFunctionParameterList(func);
                 } else {
                     return;
                 }
@@ -287,14 +299,14 @@ exports.SpellFrame = class SpellFrame {
                 func = moduleExports[key];
                 params = getFunctionParameterList(func);
             } else {
-                return; 
+                return;
             }
 
             // REGISTER WITH NAMESPACE
             // This is the key fix. We prefix the function name with the package name.
             const uniqueId = `${packageName}:${key}`;
             this.addNativeFunction(uniqueId, func, ...params);
-            
+
             // Optional: Log debug info
             // console.log(`[+] Registered native function: ${uniqueId}`);
         });
@@ -302,7 +314,7 @@ exports.SpellFrame = class SpellFrame {
 
     loadPluginsRecursively(currentDir) {
         const packageJsonPath = path.join(currentDir, 'package.json');
-        
+
         // If we've already scanned this specific directory, stop (Circular Dep protection)
         if (this.visitedPlugins.has(packageJsonPath)) return;
         this.visitedPlugins.add(packageJsonPath);
@@ -335,7 +347,7 @@ exports.SpellFrame = class SpellFrame {
 
                 // 3. Check if it is a SpellCraft module
                 if (depPkg.spellcraft) {
-                    
+
                     // A. Load the Plugin Logic
                     const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
                     this.loadPlugin(depPkg.name, jsMainPath);
@@ -374,7 +386,8 @@ exports.SpellFrame = class SpellFrame {
         } catch (e) {
             throw new Error(`Jsonnet Evaluation Error: ${e.message || e}`);
         }
-        
+
+        this.emit('render', this.lastRender);
         return this.lastRender;
     }
 
@@ -387,7 +400,8 @@ exports.SpellFrame = class SpellFrame {
         } catch (e) {
             throw new Error(`Jsonnet Evaluation Error: ${e.message || e}`);
         }
-        
+
+        this.emit('render', this.lastRender);
         return this.lastRender;
     }
 
@@ -406,7 +420,7 @@ exports.SpellFrame = class SpellFrame {
             });
         }
     }
-    
+
     write(filesToWrite = this.lastRender) {
         if (!filesToWrite || typeof filesToWrite !== 'object') return this;
 
@@ -416,14 +430,14 @@ exports.SpellFrame = class SpellFrame {
 
         if (this.cleanBeforeRender) {
             // ... (Cleaning logic remains the same)
-             try {
+            try {
                 Object.keys(this.fileTypeHandlers).forEach(regexPattern => {
                     const regex = new RegExp(regexPattern, "i");
-                    if(fs.existsSync(this.renderPath)) {
+                    if (fs.existsSync(this.renderPath)) {
                         fs.readdirSync(this.renderPath).filter(f => regex.test(f)).forEach(f => fs.unlinkSync(path.join(this.renderPath, f)));
                     }
                 });
-            } catch (e) {}
+            } catch (e) { }
         }
 
         console.log(`[+] Writing files to: ${this.renderPath}`);
@@ -437,10 +451,11 @@ exports.SpellFrame = class SpellFrame {
                     fs.writeFileSync(outputFilePath, handlerFn(filesToWrite[filename]), 'utf-8');
                     console.log('  -> ' + path.basename(outputFilePath));
                 } catch (e) {
-                     console.error(`  [!] Error writing ${filename}: ${e.message}`);
+                    console.error(`  [!] Error writing ${filename}: ${e.message}`);
                 }
             }
         }
+        this.emit('write', filesToWrite);
         return this;
     }
 };
