@@ -198,8 +198,16 @@ Learn more at [**create-spellcraft-module**](https://www.npmjs.com/package/creat
 
 | Package | Description |
 |---|---|
-| [**@c6fc/spellcraft-aws-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth) | AWS SDK authentication and API calls directly from Jsonnet. |
-| [**@c6fc/spellcraft-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-terraform) | Terraform integration and state management. |
+| [**@c6fc/spellcraft-aws-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth) | AWS credentials, role chaining, and the AWS SDK reachable from Jsonnet. |
+| [**@c6fc/spellcraft-gcp-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-auth) | GCP credentials and the googleapis client reachable from Jsonnet. |
+| [**@c6fc/spellcraft-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-terraform) | Provider-neutral Terraform lifecycle: owns `terraform-apply` and its events. |
+| [**@c6fc/spellcraft-aws-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-terraform) | S3 state backend, remote state, and artifact storage for Terraform. |
+| [**@c6fc/spellcraft-gcp-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-terraform) | GCS state backend, remote state, artifacts, and org/project bootstrapping. |
+| [**@c6fc/spellcraft-aws-s3**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-s3) | Secure-by-default S3 bucket factory, pure Jsonnet. |
+| [**@c6fc/spellcraft-aws-lambda**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-lambda) | Lambda function factory, pure Jsonnet. |
+
+Building your own? `npm init spellcraft-module` scaffolds a working plugin, and
+`npm init spellcraft` scaffolds a project to use one in.
 
 ---
 

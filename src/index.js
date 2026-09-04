@@ -18,31 +18,130 @@ const defaultFileTypeHandlers = {
 
 const defaultFileHandler = (content) => JSON.stringify(content, null, 4);
 
-function getFunctionParameterList(func) {
-    let funcStr = func.toString()
-        .replace(/\/\*[\s\S]*?\*\//g, '')
-        .replace(/\/\/(.)*/g, '')
-        .replace(/{[\s\S]*}/, '')
-        .replace(/=>/g, '')
-        .trim();
+// Every existing node_modules directory from `from` up to the filesystem root,
+// nearest first -- the same set, in the same order, that Node's own resolver
+// would consult.
+function nodeModulesPaths(from) {
+    const found = [];
 
-    const paramStartIndex = funcStr.indexOf("(") + 1;
-    const paramEndIndex = funcStr.lastIndexOf(")");
+    let current = path.resolve(from);
 
-    if (paramStartIndex === 0 || paramEndIndex === -1 || paramStartIndex >= paramEndIndex) {
-        const potentialSingleArg = funcStr.split('=>')[0].trim();
-        if (potentialSingleArg && !potentialSingleArg.includes('(') && !potentialSingleArg.includes(')')) {
-            return [potentialSingleArg].filter(p => p.length > 0);
+    while (true) {
+        if (path.basename(current) !== 'node_modules') {
+            const candidate = path.join(current, 'node_modules');
+            if (fs.existsSync(candidate)) found.push(candidate);
         }
-        return [];
+
+        const parent = path.dirname(current);
+        if (parent === current) return found;
+
+        current = parent;
+    }
+}
+
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+
+// Walks source from `start`, tracking quotes and nesting, and returns the index
+// of the delimiter that closes the one at `start`.
+function findClosingDelimiter(source, start) {
+    let depth = 0;
+    let quote = null;
+
+    for (let i = start; i < source.length; i++) {
+        const char = source[i];
+
+        if (quote) {
+            if (char === '\\') i++;
+            else if (char === quote) quote = null;
+            continue;
+        }
+
+        if (char === '"' || char === "'" || char === '`') quote = char;
+        else if (char === '(' || char === '[' || char === '{') depth++;
+        else if (char === ')' || char === ']' || char === '}') {
+            depth--;
+            if (depth === 0) return i;
+        }
     }
 
-    const paramsString = funcStr.substring(paramStartIndex, paramEndIndex);
-    if (!paramsString.trim()) return [];
+    return -1;
+}
 
-    return paramsString.split(",")
-        .map(param => param.replace(/=[\s\S]*/g, '').trim())
-        .filter(param => param.length > 0);
+// Splits a parameter list on the commas that separate parameters, ignoring any
+// that appear inside a default value's own parentheses, brackets or strings.
+function splitParameters(source) {
+    const parameters = [];
+
+    let current = '';
+    let depth = 0;
+    let quote = null;
+
+    for (let i = 0; i < source.length; i++) {
+        const char = source[i];
+
+        if (quote) {
+            current += char;
+            if (char === '\\') current += source[++i] ?? '';
+            else if (char === quote) quote = null;
+            continue;
+        }
+
+        if (char === '"' || char === "'" || char === '`') quote = char;
+        else if (char === '(' || char === '[' || char === '{') depth++;
+        else if (char === ')' || char === ']' || char === '}') depth--;
+        else if (char === ',' && depth === 0) {
+            parameters.push(current);
+            current = '';
+            continue;
+        }
+
+        current += char;
+    }
+
+    parameters.push(current);
+
+    return parameters;
+}
+
+// Recovers the parameter names of a function that was exported bare, so that
+// Jsonnet can be told what to call them.
+//
+// This reads the function's own source, which only works for source the author
+// wrote by hand. Anything ambiguous -- a destructured or computed parameter, or
+// minified source -- raises rather than guessing, because a wrong name here
+// surfaces much later as a confusing Jsonnet error at the call site. Exporting
+// as [fn, "arg1", "arg2"] states the names outright and always wins.
+function getFunctionParameterList(func, label) {
+    const source = func.toString();
+    const name = label || func.name || 'an exported function';
+
+    // `x => ...` is the only form whose parameter carries no parentheses.
+    const bare = source.match(/^(?:async\s+)?([A-Za-z_$][\w$]*)\s*=>/);
+    if (bare) return [bare[1]];
+
+    const open = source.indexOf('(');
+    if (open === -1) return [];
+
+    const close = findClosingDelimiter(source, open);
+    if (close === -1) return [];
+
+    const parameters = splitParameters(source.slice(open + 1, close))
+        .map(parameter => parameter.split('=')[0].trim())
+        .filter(parameter => parameter.length > 0)
+        // Jsonnet has no variadic call, so a rest parameter has nothing to bind
+        // to. Dropping it leaves the named leading parameters reachable.
+        .filter(parameter => !parameter.startsWith('...'));
+
+    const unusable = parameters.find(parameter => !IDENTIFIER.test(parameter));
+
+    if (unusable) {
+        throw new Error(
+            `[SpellCraft] Could not read the parameter names of '${name}' ('${unusable}' is not a plain name).\n` +
+            `    Export it as [fn, "arg1", "arg2"] to name its parameters explicitly.`
+        );
+    }
+
+    return parameters;
 }
 
 exports.SpellFrame = class SpellFrame extends EventEmitter {
@@ -69,10 +168,18 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         this.isInitialized = false;
 
         this.jsonnet = new Jsonnet()
-            .addJpath(path.join(__dirname, '../lib'))
-            // REFACTOR: Look in the local project's node_modules for explicit imports
-            .addJpath(path.join(baseDir, 'node_modules'))
-            .addJpath(path.join(baseDir, '.spellcraft'));
+            .addJpath(path.join(__dirname, '../lib'));
+
+        // Jsonnet imports name packages the same way `require` does, so they have
+        // to resolve the same way: nearest node_modules first, then each ancestor.
+        // Only checking the working directory breaks under npm workspaces, where
+        // dependencies are hoisted to the workspace root rather than installed
+        // beside the package importing them.
+        for (const modulesDir of nodeModulesPaths(baseDir)) {
+            this.jsonnet = this.jsonnet.addJpath(modulesDir);
+        }
+
+        this.jsonnet = this.jsonnet.addJpath(path.join(baseDir, '.spellcraft'));
 
         // Built-in native functions
         this.addNativeFunction("envvar", (name) => process.env[name] || false, "name");
@@ -188,8 +295,12 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                     this.loadPlugin(depName, jsMainPath);
                 }
             } catch (e) {
-                // Dependency might not be installed or resolvable, skip quietly
-                console.warn(`Debug: Could not load potential plugin ${depName}: ${e.message}`);
+                // Most dependencies aren't plugins, and some don't expose their
+                // package.json through 'exports' at all. Neither is worth reporting.
+                // Set SPELLCRAFT_DEBUG to see what was skipped.
+                if (process.env.SPELLCRAFT_DEBUG) {
+                    console.warn(`Debug: Could not load potential plugin ${depName}: ${e.message}`);
+                }
             }
         });
     }
@@ -237,8 +348,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                     [func, ...params] = moduleExports[funcName];
                 } else if (typeof moduleExports[funcName] === 'function') {
                     func = moduleExports[funcName];
-                    // You'll need the getFunctionParameterList helper from before
-                    params = getFunctionParameterList(func);
+                    params = getFunctionParameterList(func, `${file}:${funcName}`);
                 } else {
                     return;
                 }
@@ -297,7 +407,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 [func, ...params] = moduleExports[key];
             } else if (typeof moduleExports[key] === "function") {
                 func = moduleExports[key];
-                params = getFunctionParameterList(func);
+                params = getFunctionParameterList(func, `${packageName}:${key}`);
             } else {
                 return;
             }
