@@ -8,15 +8,70 @@ const { Jsonnet } = require("@hanazuki/node-jsonnet");
 
 const EventEmitter = require("events");
 
-const baseDir = process.cwd();
+// Writes text through untouched. Anything that isn't already a string still has
+// to become one, so it falls back to JSON rather than stringifying to
+// "[object Object]".
+const verbatim = (content) => (typeof content === "string" ? content : JSON.stringify(content, null, 4));
 
+// Note the doubled backslash: these are JS strings compiled to RegExp, so '\.'
+// would reach the pattern as a bare '.' and match any character.
 const defaultFileTypeHandlers = {
-    '.*?\.json$': (content) => JSON.stringify(content, null, 4),
-    '.*?\.yaml$': (content) => yaml.dump(content, { indent: 4 }),
-    '.*?\.yml$': (content) => yaml.dump(content, { indent: 4 }),
+    '.*?\\.json$': (content) => JSON.stringify(content, null, 4),
+    '.*?\\.yaml$': (content) => yaml.dump(content, { indent: 4 }),
+    '.*?\\.yml$': (content) => yaml.dump(content, { indent: 4 }),
+    '.*?\\.md$': verbatim,
+    '.*?\\.txt$': verbatim,
 };
 
-const defaultFileHandler = (content) => JSON.stringify(content, null, 4);
+// An extension with no registered handler is written verbatim rather than
+// JSON-encoded, so a plugin-free manifest can still emit arbitrary text (a
+// shell script, an HCL file with no plugin claiming .tf, ...) by simply
+// naming the key. Non-strings still fall back to JSON rather than
+// "[object Object]".
+const defaultFileHandler = verbatim;
+
+// Module-level, shared by every SpellFrame in the process -- deliberately not
+// per-instance. Some plugins keep native-side state in a plain module-level
+// object rather than in `functionContext` (aws-terraform's `projectName`,
+// discovered once via `bootstrap()` and read by every later `getArtifact()`/
+// `putArtifact()` call, is the motivating case) -- and some go further still:
+// `gcp-auth`'s credentials are handed to the `googleapis` library itself via
+// `google.options({ auth })`, a mutation of a singleton that library owns,
+// read back live on every request. Either way, the state is shared by every
+// SpellFrame that loads the plugin in this process, so two renders running at
+// the same time can interleave their writes to it -- not a Jsonnet-laziness
+// ordering hazard within one render, which is what `assertions::` and
+// explicit data-dependencies address, but genuine cross-render contamination.
+// Confirmed directly: two frames racing `init()` alone -- before either one's
+// Jsonnet evaluation even starts -- can leave a frame authenticated as the
+// *other* frame's identity, silently.
+//
+// A native call's entire async body -- everything it awaits -- resolves
+// before evaluateFile()/evaluateSnippet()'s own promise does (Jsonnet's
+// evaluation of one file runs on a single thread, and its native-call bridge
+// blocks that thread until the JS side's promise settles). So it's enough to
+// serialize every call into this queue -- init() included, since a plugin's
+// init hook makes exactly the same kind of native-adjacent calls evaluation
+// does -- and no two renders' or two inits' native calls can ever overlap,
+// full stop, regardless of what state any plugin keeps or how.
+//
+// The cost is real and worth stating plainly: renders (and the init that
+// precedes each one) in one process become fully serial, not just correctly
+// ordered. A slow render blocks every other render queued behind it, even one
+// sharing no plugins with it at all. For the CLI (one process, one manifest,
+// one render) this costs nothing. An embedder doing genuinely concurrent
+// high-throughput rendering would feel it -- finer-grained locking (only
+// serializing renders that share a loaded plugin) is the natural next step
+// if that ever matters, but isn't built here.
+let executionQueue = Promise.resolve();
+
+function serialized(fn) {
+    const result = executionQueue.then(fn, fn);
+    // However this turn comes out, the queue itself must stay healthy for the
+    // next one -- a rejection here must not wedge everything behind it.
+    executionQueue = result.then(() => {}, () => {});
+    return result;
+}
 
 // Every existing node_modules directory from `from` up to the filesystem root,
 // nearest first -- the same set, in the same order, that Node's own resolver
@@ -148,6 +203,12 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     constructor(options = {}) {
         super();
         const defaults = {
+            // Captured per instance, at construction time -- not once at module
+            // load, so a caller that constructs more than one SpellFrame against
+            // different directories (tests; anything embedding SpellFrame as a
+            // library) gets the cwd it actually asked for rather than whatever
+            // was current when this file was first required.
+            baseDir: process.cwd(),
             renderPath: "./render",
             cleanBeforeRender: true,
             useDefaultFileHandlers: true
@@ -166,20 +227,21 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         this.visitedPlugins = new Set();
         this.loadedPlugins = new Map();
         this.isInitialized = false;
+        this._jpaths = new Set();
 
-        this.jsonnet = new Jsonnet()
-            .addJpath(path.join(__dirname, '../lib'));
+        this.jsonnet = new Jsonnet();
+        this.addJpathOnce(path.join(__dirname, '../lib'));
 
         // Jsonnet imports name packages the same way `require` does, so they have
         // to resolve the same way: nearest node_modules first, then each ancestor.
         // Only checking the working directory breaks under npm workspaces, where
         // dependencies are hoisted to the workspace root rather than installed
         // beside the package importing them.
-        for (const modulesDir of nodeModulesPaths(baseDir)) {
-            this.jsonnet = this.jsonnet.addJpath(modulesDir);
+        for (const modulesDir of nodeModulesPaths(this.baseDir)) {
+            this.addJpathOnce(modulesDir);
         }
 
-        this.jsonnet = this.jsonnet.addJpath(path.join(baseDir, '.spellcraft'));
+        this.addJpathOnce(path.join(this.baseDir, '.spellcraft'));
 
         // Built-in native functions
         this.addNativeFunction("envvar", (name) => process.env[name] || false, "name");
@@ -187,7 +249,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
 
         // REFACTOR: Automatically find and register plugins from package.json
         this.loadPluginsFromDependencies();
-        this.loadPluginsRecursively(baseDir);
+        this.loadPluginsRecursively(this.baseDir);
         this.validatePluginRequirements();
 
         // 2. Load Local Magic Modules (Rapid Prototyping Mode)
@@ -196,6 +258,16 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
 
     _generateCacheKey(functionName, args) {
         return crypto.createHash('sha256').update(JSON.stringify([functionName, ...args])).digest('hex');
+    }
+
+    // Adds a Jsonnet library search path, skipping it if already present. Called
+    // often -- once per node_modules ancestor of every plugin loaded -- and a
+    // workspace has most plugins sharing the same physical root, so without the
+    // dedup, jpath would grow by that many redundant entries per plugin.
+    addJpathOnce(dir) {
+        if (this._jpaths.has(dir)) return;
+        this._jpaths.add(dir);
+        this.jsonnet = this.jsonnet.addJpath(dir);
     }
 
     addFileTypeHandler(pattern, handler) {
@@ -257,15 +329,24 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     async init() {
         if (this.isInitialized) return;
 
-        for (const step of this.initFn) {
-            await step(this);
-        }
+        // Serialized against every other SpellFrame's init() and evaluation in
+        // this process -- see the comment on executionQueue for why. Re-check
+        // isInitialized once inside: two calls to init() on this *same* frame
+        // could both pass the guard above before either reaches the queue, and
+        // the second one through must not repeat the first's work.
+        await serialized(async () => {
+            if (this.isInitialized) return;
 
-        this.isInitialized = true;
+            for (const step of this.initFn) {
+                await step(this);
+            }
+
+            this.isInitialized = true;
+        });
     }
 
     loadPluginsFromDependencies() {
-        const packageJsonPath = path.join(baseDir, 'package.json');
+        const packageJsonPath = path.join(this.baseDir, 'package.json');
         if (!fs.existsSync(packageJsonPath)) return;
 
         let pkg;
@@ -306,8 +387,8 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     }
 
     loadLocalMagicModules() {
-        const localModulesDir = path.join(baseDir, 'spellcraft_modules');
-        const generatedDir = path.join(baseDir, '.spellcraft');
+        const localModulesDir = path.join(this.baseDir, 'spellcraft_modules');
+        const generatedDir = path.join(this.baseDir, '.spellcraft');
         const aggregateFile = path.join(generatedDir, 'modules');
 
         if (!fs.existsSync(localModulesDir)) {
@@ -385,6 +466,25 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         let moduleExports;
         try {
             moduleExports = require(jsMainPath);
+
+            // A plugin's own module.libsonnet can `import` another package by
+            // name, the same way this file's module.js just required one with
+            // `require()`. require() resolves that by walking up from the
+            // plugin's real location on disk -- which is why it works even when
+            // the plugin is only a transitive dependency, reached through a
+            // symlink (npm workspaces, `file:`, `npm link`). Jsonnet's import
+            // has no per-file equivalent; it only ever searches `jpath`, which
+            // until now only ever covered the *consumer's* node_modules
+            // ancestry. A plugin's own import then resolved only by accident,
+            // when the consumer happened to also carry that dependency
+            // (hoisting under a plain registry install papers over this, which
+            // is why it surfaces only in linked-development setups). Adding the
+            // plugin's own ancestry closes the gap; realpath first, since the
+            // walk has to follow the symlink to mean anything.
+            const pluginRealDir = fs.realpathSync(path.dirname(jsMainPath));
+            for (const modulesDir of nodeModulesPaths(pluginRealDir)) {
+                this.addJpathOnce(modulesDir);
+            }
         } catch (e) {
             console.warn(`[!] Failed to load plugin ${packageName}: ${e.message}`);
             return;
@@ -439,7 +539,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         // Combine dependencies (devDeps are usually only relevant at the root, 
         // but we scan both for completeness at the root level).
         // For sub-dependencies, standard 'dependencies' is usually what matters.
-        const deps = { ...pkg.dependencies, ...(currentDir === baseDir ? pkg.devDependencies : {}) };
+        const deps = { ...pkg.dependencies, ...(currentDir === this.baseDir ? pkg.devDependencies : {}) };
 
         // Create a resolver anchored to the CURRENT directory.
         // This is crucial: it tells Node "Find dependencies relative to THIS module",
@@ -473,6 +573,42 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         });
     }
 
+    // Both render() and renderString() funnel through here so a hidden
+    // top-level `assertions::` field is guaranteed to run before anything is
+    // written -- the conventional place for a manifest to put an
+    // aws.assertIdentity()/gcp.assertProject() style guard.
+    //
+    // Hidden fields are invisible to manifestation: Jsonnet only walks and
+    // serialises visible ones, so a lazy `assertions::` field only ever ran if
+    // its value happened to be threaded into something visible too (returning
+    // it into `allowed_account_ids`, say). Get that threading wrong -- the
+    // easier mistake -- and the guard fails open, silently, which is the one
+    // thing an assertion must never do.
+    //
+    // The fix doesn't need Jsonnet to do anything it doesn't already do: read
+    // the hidden field through a *visible* field of a throwaway wrapper
+    // object, and let ordinary manifestation force it, the same way it forces
+    // every other visible field. A failing `assert` inside `assertions::`
+    // throws while that wrapper is being manifested, before a single file is
+    // written -- and the wrapper itself is discarded here, so a manifest's own
+    // author never sees it.
+    async evaluateManifestExpression(expression) {
+        const wrapper = `local __spellcraft_manifest__ = (${expression});\n` +
+            `{\n` +
+            `    manifest: __spellcraft_manifest__,\n` +
+            `    assertions: if std.isObject(__spellcraft_manifest__) && std.objectHasAll(__spellcraft_manifest__, "assertions")\n` +
+            `        then __spellcraft_manifest__.assertions\n` +
+            `        else null,\n` +
+            `}`;
+
+        // Serialized process-wide -- see the comment on executionQueue for why.
+        const evaluated = await serialized(async () => {
+            return JSON.parse(await this.jsonnet.evaluateSnippet(wrapper));
+        });
+
+        return evaluated.manifest;
+    }
+
     async render(file) {
 
         if (!this.isInitialized) {
@@ -492,7 +628,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
 
         try {
             console.log(`[+] Evaluating Jsonnet file: ${absoluteFilePath}`);
-            this.lastRender = JSON.parse(await this.jsonnet.evaluateFile(absoluteFilePath));
+            this.lastRender = await this.evaluateManifestExpression(`import ${JSON.stringify(absoluteFilePath)}`);
         } catch (e) {
             throw new Error(`Jsonnet Evaluation Error: ${e.message || e}`);
         }
@@ -506,7 +642,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         this.activePath = process.cwd();
 
         try {
-            this.lastRender = JSON.parse(await this.jsonnet.evaluateSnippet(snippet));
+            this.lastRender = await this.evaluateManifestExpression(snippet);
         } catch (e) {
             throw new Error(`Jsonnet Evaluation Error: ${e.message || e}`);
         }
@@ -531,6 +667,73 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         }
     }
 
+    // Where write() stashes the list of filenames it produced last time, so a
+    // later clean can remove exactly those rather than sweeping render/ for
+    // anything that merely matches a registered extension. A subdirectory, not
+    // a top-level file: Terraform only reads files directly in render/, not
+    // subdirectories, so this is invisible to it regardless of the leading
+    // dot.
+    get manifestPath() {
+        return path.join(this.renderPath, '.spellcraft', 'manifest.json');
+    }
+
+    // Deletes exactly what the previous write() produced, per the manifest it
+    // left behind -- not everything in render/ that happens to match a
+    // registered pattern. A hand-written file that merely shares an extension
+    // with something SpellCraft generates (a README.md living beside a
+    // generated one) is never SpellCraft's to delete, and silently sweeping by
+    // pattern can't tell the two apart.
+    //
+    // The very first write() against a render/ directory has no manifest to
+    // read -- either render/ is new, or it predates this manifest existing at
+    // all. Only in that one case, fall back to the old sweep-by-registered-
+    // pattern, so upgrading doesn't strand pre-manifest output forever; every
+    // clean after that first write is manifest-driven.
+    cleanRenderPath() {
+        if (!fs.existsSync(this.renderPath)) return;
+
+        if (!fs.existsSync(this.manifestPath)) {
+            try {
+                Object.keys(this.fileTypeHandlers).forEach(regexPattern => {
+                    const regex = new RegExp(regexPattern, "i");
+                    fs.readdirSync(this.renderPath)
+                        .filter(f => regex.test(f))
+                        .forEach(f => this.removeRenderedFile(f));
+                });
+            } catch (e) {
+                console.warn(`  [!] Could not sweep ${this.renderPath}: ${e.message}`);
+            }
+            return;
+        }
+
+        let previous;
+        try {
+            previous = JSON.parse(fs.readFileSync(this.manifestPath, 'utf-8'));
+        } catch (e) {
+            console.warn(`  [!] Could not read ${this.manifestPath}, leaving ${this.renderPath} untouched: ${e.message}`);
+            return;
+        }
+
+        if (!Array.isArray(previous)) return;
+
+        previous.forEach(filename => this.removeRenderedFile(filename));
+    }
+
+    // Unlike the try{}catch(e){} this replaces, failures and removals are both
+    // reported rather than swallowed -- nothing here should be a silent
+    // no-op.
+    removeRenderedFile(filename) {
+        const filePath = path.join(this.renderPath, filename);
+        if (!fs.existsSync(filePath)) return;
+
+        try {
+            fs.unlinkSync(filePath);
+            console.log('  -x ' + filename);
+        } catch (e) {
+            console.warn(`  [!] Could not remove ${filename}: ${e.message}`);
+        }
+    }
+
     write(filesToWrite = this.lastRender) {
         if (!filesToWrite || typeof filesToWrite !== 'object') return this;
 
@@ -539,18 +742,11 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         }
 
         if (this.cleanBeforeRender) {
-            // ... (Cleaning logic remains the same)
-            try {
-                Object.keys(this.fileTypeHandlers).forEach(regexPattern => {
-                    const regex = new RegExp(regexPattern, "i");
-                    if (fs.existsSync(this.renderPath)) {
-                        fs.readdirSync(this.renderPath).filter(f => regex.test(f)).forEach(f => fs.unlinkSync(path.join(this.renderPath, f)));
-                    }
-                });
-            } catch (e) { }
+            this.cleanRenderPath();
         }
 
         console.log(`[+] Writing files to: ${this.renderPath}`);
+        const written = [];
         for (const filename in filesToWrite) {
             if (Object.prototype.hasOwnProperty.call(filesToWrite, filename)) {
                 const outputFilePath = path.join(this.renderPath, filename);
@@ -560,11 +756,19 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 try {
                     fs.writeFileSync(outputFilePath, handlerFn(filesToWrite[filename]), 'utf-8');
                     console.log('  -> ' + path.basename(outputFilePath));
+                    written.push(filename);
                 } catch (e) {
                     console.error(`  [!] Error writing ${filename}: ${e.message}`);
                 }
             }
         }
+
+        // Only what was actually written lands in the manifest -- a file whose
+        // write() threw above stays out, so a transient failure this run
+        // doesn't get "cleaned" as if it were stale next run.
+        fs.mkdirSync(path.dirname(this.manifestPath), { recursive: true });
+        fs.writeFileSync(this.manifestPath, JSON.stringify(written, null, 4), 'utf-8');
+
         this.emit('write', filesToWrite);
         return this;
     }

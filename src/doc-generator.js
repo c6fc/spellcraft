@@ -44,9 +44,14 @@ class DocGenerator {
         if (!fs.existsSync(libPath)) return '';
 
         const content = fs.readFileSync(libPath, 'utf-8');
-        // Regex to find /** comments */ followed by a function definition
+        // Finds a /** comment */ followed by a member definition.
         // Captures: 1=Comment content, 2=FunctionName, 3=Args
-        const regex = /\/\*\*([\s\S]*?)\*\/\s*\n\s*([\w]+)\(([^)]*)\)/g;
+        //
+        // The argument list runs to the ')' that precedes the member's ':' or
+        // '::', rather than to the first ')' encountered — a default value may
+        // call a function, as in `api(path, params={ project: getProjectId() })`,
+        // and stopping at the first ')' truncated the signature mid-way.
+        const regex = /\/\*\*([\s\S]*?)\*\/\s*\n\s*([\w]+)\(([\s\S]*?)\)\s*::?(?!:)/g;
         
         let match;
         let markdown = "## API Reference\n\n";

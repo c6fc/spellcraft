@@ -4,6 +4,18 @@
 
 ### Major Changes
 
+- Emit verbatim text. `.md` and `.txt` now have default handlers that write a
+  string through untouched, and plugins can register handlers of their own for
+  other text formats.
+
+  Previously every default handler and the no-match fallback ran
+  `JSON.stringify`, so a Markdown file arrived on disk quoted with its newlines
+  as literal `\n` — there was no way to emit raw text at all.
+
+  The three existing patterns also had their escaping corrected: written as JS
+  strings, `'.*?\.json$'` reached `RegExp` as `.*?.json$`, where the dot was a
+  wildcard rather than a literal.
+
 - Jsonnet imports now resolve package names the way `require` does: the nearest
   `node_modules` first, then each ancestor. Previously only the working
   directory's `node_modules` was searched, so a plugin importing another
