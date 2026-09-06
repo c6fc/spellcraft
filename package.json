@@ -1,22 +1,32 @@
 {
   "dependencies": {
     "@colors/colors": "^1.6.0",
-    "@hanazuki/node-jsonnet": "^3.0.1",
+    "@hanazuki/node-jsonnet": "^3.1.1",
     "js-yaml": "^4.1.0",
     "yargs": "^18.0.0"
   },
   "name": "@c6fc/spellcraft",
   "description": "Extensible JSonnet CLI platform",
-  "version": "0.1.5",
+  "version": "1.0.0",
   "main": "src/index.js",
   "directories": {
     "lib": "lib"
   },
+  "files": [
+    "bin",
+    "lib",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
   "bin": {
     "spellcraft": "bin/spellcraft.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "test": "node src/test.js"
+    "test": "node --test test/*.test.js"
   },
   "repository": {
     "type": "git",

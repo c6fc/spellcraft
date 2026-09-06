@@ -1,169 +1,364 @@
-# ✨ SpellCraft ✨
+# SpellCraft
 
-**The Sorcerer's Toolkit for Unified Configuration Management.**
+Configuration that discovers its own context.
 
-SpellCraft is a plugin framework for [Jsonnet](https://jsonnet.org/) that bridges the gap between declarative configuration and the Node.js ecosystem. It allows you to import NPM packages directly into your Jsonnet logic, execute native JavaScript functions during configuration generation, and manage complex infrastructure-as-code requirements from a single, gnostic workflow.
+SpellCraft evaluates [Jsonnet](https://jsonnet.org/) with Node.js reachable from
+inside it, then writes the result to disk. Because evaluation can call live APIs,
+a configuration can work out its own account IDs, existing buckets and enabled
+services instead of having those values pasted into it.
 
-SpellCraft provides a single, unified source of truth, letting you orchestrate any tool that needs machine-readable configurations (like Terraform, Packer, Kubernetes, or Ansible) from one place.
+It emits ordinary machine-readable files — most often Terraform JSON — and owns
+no state of its own.
 
 [![NPM Version](https://img.shields.io/npm/v/@c6fc/spellcraft.svg)](https://www.npmjs.com/package/@c6fc/spellcraft)
 [![License](https://img.shields.io/npm/l/@c6fc/spellcraft.svg)](https://github.com/c6fc/spellcraft/blob/main/LICENSE)
 
----
+Full documentation: **[spellcraft.io](https://spellcraft.io)**
 
-## The SpellCraft Philosophy
+## Requirements
 
-1.  **Declarative Power (Jsonnet):** Configurations are written in Jsonnet. Variables, functions, and inheritance allow you to define components once and reuse them everywhere.
-2.  **Native Node.js Resolution:** No custom registries. No hidden magic. SpellCraft modules are just NPM packages. If you can `npm install` it, SpellCraft can load it.
-3.  **Scoped Extensibility:** Native JavaScript functions are automatically namespaced based on their package name, ensuring that dependencies never clash, even if multiple modules use different versions of the same library.
+Node.js 18 or newer, and a C++ toolchain — Jsonnet is compiled from source when
+`@hanazuki/node-jsonnet` installs. On Debian or Ubuntu that means
+`build-essential` and `cmake`; on macOS, the Xcode command line tools. A wall of
+`node-gyp` output during install is almost always this.
 
-## Quick Start
+## Quick start
 
-### 1. Installation
-
-Install the CLI and core library.
-
-```sh
-npm install --save @c6fc/spellcraft
+```bash
+npm init spellcraft my-infra
+cd my-infra
+npm run gen
 ```
 
-### 2. Install a Plugin
+Or add it to a project you already have:
 
-Install a SpellCraft-compatible plugin using standard NPM.
-
-```sh
+```bash
+npm install --save @c6fc/spellcraft
 npm install --save @c6fc/spellcraft-aws-auth
 ```
 
-### 3. Write Your Spell
-
-Create a `manifest.jsonnet` file. Unlike previous versions of SpellCraft, you import modules explicitly using standard Node resolution.
+Write a `manifest.jsonnet`. Its top-level keys are filenames, and their values
+are the file contents:
 
 ```jsonnet
-// Import the library directly from node_modules
-local aws = import '@c6fc/spellcraft-aws-auth/module.libsonnet';
+local spellcraft = import "spellcraft";
+local aws = import "@c6fc/spellcraft-aws-auth/module.libsonnet";
+
+// envvar() returns false when a variable is unset, which makes defaulting
+// an ordinary conditional.
+local region =
+	local declared = spellcraft.envvar("AWS_REGION");
+	if declared == false then "us-east-1" else declared;
 
 {
-  // Use functions provided by the module
-  'aws-identity.json': aws.getCallerIdentity(),
+	"identity.json": aws.getCallerIdentity(),
 
-  'config.yaml': {
-    apiVersion: 'v1',
-    kind: 'ConfigMap',
-    metadata: { name: 'my-app-config' },
-    data: {
-      // Use built-in native functions
-      region: std.native('envvar')('AWS_REGION') || 'us-east-1',
-      callerArn: aws.getCallerIdentity().Arn,
-    },
-  },
+	"config.yaml": {
+		apiVersion: "v1",
+		kind: "ConfigMap",
+		metadata: { name: "my-app-config" },
+		data: {
+			region: region,
+			account: aws.getCallerIdentity().Account,
+		},
+	},
 }
 ```
 
-### 4. Generate Artifacts
+Render it:
 
-Run the generator. SpellCraft automatically detects installed plugins in your `package.json`, registers their native functions, and renders your configuration.
-
-```sh
+```bash
 npx spellcraft generate manifest.jsonnet
 
-# Expected Output:
-# [+] Evaluating Jsonnet file: .../manifest.jsonnet
-# [+] Writing files to: render
-#   -> aws-identity.json
+# [+] Evaluating Jsonnet file: /path/to/manifest.jsonnet
+# [+] Writing files to: ./render
+#   -> identity.json
 #   -> config.yaml
 # [+] Generation complete.
 ```
 
----
+The account number in `config.yaml` was fetched from STS while the Jsonnet was
+being evaluated. Nobody typed it, and nobody has to update it when you change
+accounts.
 
-## Rapid Prototyping (Local Modules)
-
-Sometimes you need a custom function just for your current project, and you don't want to publish a full NPM package. SpellCraft provides a **Local Magic** folder for this.
-
-1.  Create a folder named `spellcraft_modules` in your project root.
-2.  Create a JavaScript file, e.g., `spellcraft_modules/utils.js`:
-
-```javascript
-// spellcraft_modules/utils.js
-exports.shout = (text) => text.toUpperCase() + "!!!";
-exports.add = (a, b) => a + b;
-
-// Use standard functions to access 'this', which is extended by plugins:
-exports.know_thyself = function() {
-  this.aws.getCallerIdentity()
-}
-```
-
-3.  In your Jsonnet file, import `modules` to access your exported functions:
+## Three kinds of import
 
 ```jsonnet
-// Import the automatically generated local module aggregator
-local modules = import 'modules';
+local spellcraft = import "spellcraft";                           // built-ins
+local modules = import "modules";                                 // spellcraft_modules/
+local aws = import "@c6fc/spellcraft-aws-auth/module.libsonnet";  // installed plugins
+```
+
+`"spellcraft"` is the built-in library, and is deliberately small:
+
+| | |
+|---|---|
+| `spellcraft.envvar(name)` | the environment variable, or `false` if unset |
+| `spellcraft.path()` | the directory of the manifest being rendered |
+
+Plugins are imported by package name. SpellCraft finds them by walking your
+project's dependencies for packages flagged `"spellcraft": true`, so installing
+one is the whole of the setup — there is no registry and nothing to register.
+
+## Local modules
+
+For logic that belongs to one project and doesn't warrant a package, drop a
+`.js` file into `spellcraft_modules/`. Its exports become callable from Jsonnet,
+namespaced by filename:
+
+```javascript
+// spellcraft_modules/util.js
+exports.slug = [(text) => text.toLowerCase().replace(/[^a-z0-9]+/g, '-'), 'text'];
+
+exports.replicasFor = [(environment) => environment === 'prod' ? 3 : 1, 'environment'];
+```
+
+```jsonnet
+local modules = import "modules";
 
 {
-  'test.json': {
-    // Access your local JS functions here
-    // Our file was named 'utils.js', so the exported
-    // functions are accessed via 'modules.utils'.
-    message: modules.utils.shout("hello world"),
-    sum: modules.utils.add(10, 5)
-  }
+	"app.json": {
+		name: modules.util.slug("My First Spell"),
+		replicas: modules.util.replicasFor("prod"),
+	},
 }
 ```
 
----
+Export either a bare function or `[fn, ...parameterNames]`. Prefer the explicit
+form: Jsonnet calls native functions by parameter name, so the names have to be
+recovered from the function source otherwise, and that cannot work for minified
+or destructured parameters. SpellCraft raises at load time when it can't read
+them rather than registering something that fails later at a call site.
 
-## The SpellCraft CLI
+## Output
 
-The CLI is automatically extended by installed modules.
+Each top-level key is written into `render/`, serialised by the first handler
+whose pattern matches the filename:
 
-*   `spellcraft generate <filename>`: Renders a Jsonnet file to the `render/` directory.
-*   `spellcraft --help`: Lists all available commands, including those added by plugins (e.g., `spellcraft aws-identity`).
+| Pattern | Output |
+|---|---|
+| `.json` | pretty-printed JSON |
+| `.yaml`, `.yml` | YAML, four-space indent |
+| `.md`, `.txt` | verbatim — a string is written through untouched |
+| anything else | verbatim — same as `.md`/`.txt`; a non-string still falls back to pretty-printed JSON |
 
----
+Plugins register their own through `fileTypeHandlers`;
+`@c6fc/spellcraft-terraform` claims `.tf`, which is how hand-written HCL can be
+carried into a spell alongside generated configuration.
+
+Before writing, SpellCraft removes whatever its own previous `write()` put
+there — not everything in `render/` that happens to match a registered
+pattern — so a renamed output cannot linger, and a hand-written file that
+merely shares an extension with something SpellCraft generates is never
+touched. The list of what was written lives at
+`render/.spellcraft/manifest.json`; each removal is logged (`  -x name`), and
+nothing is deleted silently. Terraform only reads files directly inside
+`render/`, not subdirectories, so this is invisible to it.
+
+The one exception is a `render/` directory with no manifest yet — freshly
+created, or left over from before this existed — where SpellCraft falls back
+to the old sweep-by-registered-pattern once, so an upgrade doesn't strand
+old output forever. Every write after that first one is manifest-driven.
+
+## Assertions
+
+A manifest can guard itself against rendering in the wrong context — the
+wrong account, the wrong project — with a conventional hidden field:
+
+```jsonnet
+local aws = import "@c6fc/spellcraft-aws-auth/module.libsonnet";
+
+{
+	assertions:: aws.assertIdentity('arn:aws:iam::123456789012:user/you'),
+
+	"main.tf.json": { ... },
+}
+```
+
+`assertions::` is hidden (`::`, not `:`), so it never shows up as a file to
+write. Ordinarily that would make it a no-op: Jsonnet's manifestation only
+walks and serialises *visible* fields, so a lazy hidden field only runs if
+its value happens to get threaded into something visible too — easy to get
+wrong, and a guard that fails open, silently, on the one thing it exists to
+catch is worse than no guard at all.
+
+`assertions::` doesn't have that failure mode. Both `render()` and
+`renderString()` read it back through a throwaway wrapper, as a *visible*
+field of that wrapper, and let ordinary manifestation force it — the same
+way it forces every other visible field. A failing `assert` inside it throws
+right there, before a single file is written, whether or not anything else
+in the manifest references it. The wrapper itself never reaches
+`lastRender`, so a manifest's own author never sees it, and `assertions`
+never appears in what gets written.
+
+The value can be anything — a single `assert...; value` expression, or an
+object combining several named checks so a failure names which one:
+
+```jsonnet
+{
+	assertions:: {
+		account: aws.assertIdentity('arn:aws:iam::123456789012:user/you'),
+		project: gcp.assertProject('my-project-1234'),
+	},
+}
+```
+
+## CLI
+
+```
+spellcraft generate <filename>   Evaluate a manifest and write the result
+spellcraft doc                   Regenerate this package's README API reference
+spellcraft --help                List every command, plugins included
+```
+
+Plugins extend the CLI, so `--help` differs between projects. `spellcraft doc`
+reads the doc comments in a plugin's `module.libsonnet` and the commands it
+registers, then replaces the content between marker comments in `README.md`:
+
+```html
+<!-- SPELLCRAFT_DOCS_API_START -->
+<!-- SPELLCRAFT_DOCS_CLI_START -->
+```
 
 ## Programmatic API
 
-You can embed SpellCraft into your own Node.js scripts for advanced automation.
+The CLI is a thin wrapper over `SpellFrame`.
 
 ```javascript
 const { SpellFrame } = require('@c6fc/spellcraft');
-const path = require('path');
 
-const frame = new SpellFrame();
+const frame = new SpellFrame({ renderPath: './out' });
 
 (async () => {
-    // 1. Initialize: Scans package.json for plugins and loads them
     await frame.init();
+    const rendered = await frame.render('manifest.jsonnet');
 
-    // 2. Render: Evaluates the Jsonnet
-    // Note: The result is a pure JS object
-    const result = await frame.render(path.resolve('./manifest.jsonnet'));
-    console.log(result);
+    console.log(Object.keys(rendered));
 
-    // 3. Write: Outputs files to disk (applying JSON/YAML transformations)
     frame.write();
 })();
 ```
 
-## Creating Modules
+The **constructor** does the discovery: it loads plugins from your dependency
+tree, validates that each plugin's declared `requires` are present, and builds
+the `spellcraft_modules/` bridge. It can throw, and it is not free.
 
-A SpellCraft module is simply an NPM package with specific metadata. You can get a head-start with:
-```bash
-npm init spellcraft-module @your_org/your_module
+`init()` then runs each plugin's init hook once — credentials, network calls,
+subprocess launches. `render()` calls it for you if you haven't.
+
+Two renders in the same process — two `SpellFrame`s, or the same one called
+twice without awaiting the first — never evaluate at the same time, and
+neither do their `init()` calls. Both are serialized process-wide, on
+purpose: some plugins keep state in a module-level object rather than
+per-instance (`spellcraft-aws-terraform`'s `projectName`, set by `bootstrap()`
+and read by every later `getArtifact()`/`putArtifact()` call, is one case;
+`spellcraft-gcp-auth` handing its resolved credentials to the `googleapis`
+library's own global config during `init()` is a sharper one), and that state
+is shared by every `SpellFrame` that loads the plugin in the same process.
+Without serializing, two concurrent renders' — or two concurrent `init()`
+calls' — native calls could interleave their writes to it. The cost is real:
+a slow render (or init) blocks every other one queued behind it, even one
+sharing no plugins with it at all. For the CLI (one process, one manifest,
+one render) this costs nothing; an embedder doing genuinely concurrent
+rendering will feel the ceiling.
+
+This closes literal concurrent execution — two native calls never run at the
+same instant — but on its own that isn't quite enough: another frame's
+`init()` can still be queued *between* a given frame's own `init()` and its
+own evaluation (they're separate turns), so a plugin whose state is a bare
+module-level singleton could still end up evaluating one frame's manifest
+against a *different* frame's resolved identity, just without ever
+overlapping in time.
+
+SpellCraft doesn't try to make that safe by making credential state per-frame.
+Instead, `spellcraft-gcp-auth` takes the position that **a process has exactly
+one authentication context, ever** — the first successful `init()` locks it
+in, and any later `init()` (from any frame) that would resolve to a
+*different* identity throws, before touching any credential or making any
+call, rather than silently replacing what's active. The same identity twice
+is a no-op. A spell needing a different GCP *project* under one identity uses
+`providerAliases()`; a genuinely different identity needs a separate process.
+`spellcraft-aws-terraform`/`spellcraft-gcp-terraform`'s `bootstrap()` applies
+the same rule to a spell's own project name — a second `bootstrap()` call
+with a different name in the same process throws rather than silently moving
+`getArtifact()`/`putArtifact()` to a new namespace mid-manifest.
+
+| Option | Default | Effect |
+|---|---|---|
+| `renderPath` | `./render` | where `write()` puts files |
+| `cleanBeforeRender` | `true` | delete matching files before writing |
+| `useDefaultFileHandlers` | `true` | register the built-in serialisers |
+
+Useful methods beyond the three above: `renderString(snippet)`,
+`addNativeFunction(name, fn, ...parameterNames)`,
+`addFileTypeHandler(pattern, handler)`, and `loadPlugin(packageName, jsMainPath)`
+— which is how a plugin's own test harness loads the package it lives in, since
+discovery only finds *dependencies*, never the current package.
+
+`addExternalCode(name, value)` backs `std.extVar`, and its name is exact: a
+string value is evaluated as **Jsonnet source**, not wrapped as a literal.
+Anything else is passed through `JSON.stringify` first, so objects behave the
+way you would expect and bare strings do not.
+
+```javascript
+frame.addExternalCode('settings', { region: 'us-east-1' });  // std.extVar('settings').region
+frame.addExternalCode('name', JSON.stringify('prod'));       // std.extVar('name') === 'prod'
+frame.addExternalCode('name', 'prod');                       // STATIC ERROR: Unknown variable: prod
 ```
 
-Learn more at [**create-spellcraft-module**](https://www.npmjs.com/package/create-spellcraft-module)
+Native function results are memoised per `(name, arguments)` for the life of a
+render, so calling `getCallerIdentity()` in forty places costs one API call.
+Side effects therefore fire once.
 
-## Community Modules
+## Events
+
+`SpellFrame` extends Node's `EventEmitter`.
+
+| Event | When | Argument |
+|---|---|---|
+| `render` | after a manifest evaluates | the rendered object |
+| `write` | after files are written | the object written |
+| `<package>:<export>` | when a native function actually runs | its arguments |
+
+```javascript
+frame.on('render', (output) => console.log('rendered', Object.keys(output)));
+```
+
+Because results are memoised, a native function's event fires on the first call
+for a given argument list and not on the identical calls that follow. It marks
+work actually happening, not the number of call sites.
+
+`emitAsync(event, ...args)` awaits each listener in turn, which is how plugins
+order work across packages that know nothing about one another —
+`@c6fc/spellcraft-terraform` emits `@c6fc/spellcraft-terraform:pre-apply` before
+`terraform apply`, and `@c6fc/spellcraft-gcp-terraform` listens on it to enable
+the GCP services the rendered configuration needs first.
+
+## Writing a plugin
+
+A plugin is an npm package with `"spellcraft": true` in its `package.json`,
+exporting native functions and an optional `_spellcraft_metadata` block.
+
+```bash
+npm init spellcraft-module my-plugin
+```
+
+That scaffolds a working plugin whose tests pass on the first run. The contract
+is documented at
+[spellcraft.io/docs/plugin-contract.html](https://spellcraft.io/docs/plugin-contract.html)
+and in [create-spellcraft-module](https://www.npmjs.com/package/create-spellcraft-module).
+
+## Plugins
 
 | Package | Description |
 |---|---|
-| [**@c6fc/spellcraft-aws-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth) | AWS SDK authentication and API calls directly from Jsonnet. |
-| [**@c6fc/spellcraft-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-terraform) | Terraform integration and state management. |
-
----
+| [**@c6fc/spellcraft-aws-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth) | AWS credentials, role chaining, and the AWS SDK reachable from Jsonnet. |
+| [**@c6fc/spellcraft-gcp-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-auth) | GCP credentials and the googleapis client reachable from Jsonnet. |
+| [**@c6fc/spellcraft-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-terraform) | Provider-neutral Terraform lifecycle: owns `terraform-apply` and its events. |
+| [**@c6fc/spellcraft-aws-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-terraform) | S3 state backend, remote state, and artifact storage for Terraform. |
+| [**@c6fc/spellcraft-gcp-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-terraform) | GCS state backend, remote state, artifacts, and org/project bootstrapping. |
+| [**@c6fc/spellcraft-aws-s3**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-s3) | Secure-by-default S3 bucket factory, pure Jsonnet. |
+| [**@c6fc/spellcraft-aws-lambda**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-lambda) | Lambda function factory, pure Jsonnet. |
 
 ## License
 
