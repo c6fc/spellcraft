@@ -34,7 +34,7 @@ Or add it to a project you already have:
 
 ```bash
 npm install --save @c6fc/spellcraft
-npm install --save @c6fc/spellcraft-aws-auth
+npm install --save @c6fc/spellcraft-plugins
 ```
 
 Write a `manifest.jsonnet`. Its top-level keys are filenames, and their values
@@ -42,7 +42,7 @@ are the file contents:
 
 ```jsonnet
 local spellcraft = import "spellcraft";
-local aws = import "@c6fc/spellcraft-aws-auth/module.libsonnet";
+local aws = (import "@c6fc/spellcraft-plugins/module.libsonnet").aws.auth;
 
 // envvar() returns false when a variable is unset, which makes defaulting
 // an ordinary conditional.
@@ -84,9 +84,17 @@ accounts.
 ## Three kinds of import
 
 ```jsonnet
-local spellcraft = import "spellcraft";                           // built-ins
-local modules = import "modules";                                 // spellcraft_modules/
-local aws = import "@c6fc/spellcraft-aws-auth/module.libsonnet";  // installed plugins
+local spellcraft = import "spellcraft";                              // built-ins
+local modules = import "modules";                                    // spellcraft_modules/
+local plugins = import "@c6fc/spellcraft-plugins/module.libsonnet";  // installed plugins
+
+{
+	"context.json": {
+		renderedFrom: spellcraft.path(),
+		name: modules.util.slug("My First Spell"),
+		account: plugins.aws.auth.getCallerIdentity().Account,
+	},
+}
 ```
 
 `"spellcraft"` is the built-in library, and is deliberately small:
@@ -143,7 +151,7 @@ whose pattern matches the filename:
 | anything else | verbatim — same as `.md`/`.txt`; a non-string still falls back to pretty-printed JSON |
 
 Plugins register their own through `fileTypeHandlers`;
-`@c6fc/spellcraft-terraform` claims `.tf`, which is how hand-written HCL can be
+`@c6fc/spellcraft-plugins`'s terraform node claims `.tf`, which is how hand-written HCL can be
 carried into a spell alongside generated configuration.
 
 Before writing, SpellCraft removes whatever its own previous `write()` put
@@ -159,49 +167,6 @@ The one exception is a `render/` directory with no manifest yet — freshly
 created, or left over from before this existed — where SpellCraft falls back
 to the old sweep-by-registered-pattern once, so an upgrade doesn't strand
 old output forever. Every write after that first one is manifest-driven.
-
-## Assertions
-
-A manifest can guard itself against rendering in the wrong context — the
-wrong account, the wrong project — with a conventional hidden field:
-
-```jsonnet
-local aws = import "@c6fc/spellcraft-aws-auth/module.libsonnet";
-
-{
-	assertions:: aws.assertIdentity('arn:aws:iam::123456789012:user/you'),
-
-	"main.tf.json": { ... },
-}
-```
-
-`assertions::` is hidden (`::`, not `:`), so it never shows up as a file to
-write. Ordinarily that would make it a no-op: Jsonnet's manifestation only
-walks and serialises *visible* fields, so a lazy hidden field only runs if
-its value happens to get threaded into something visible too — easy to get
-wrong, and a guard that fails open, silently, on the one thing it exists to
-catch is worse than no guard at all.
-
-`assertions::` doesn't have that failure mode. Both `render()` and
-`renderString()` read it back through a throwaway wrapper, as a *visible*
-field of that wrapper, and let ordinary manifestation force it — the same
-way it forces every other visible field. A failing `assert` inside it throws
-right there, before a single file is written, whether or not anything else
-in the manifest references it. The wrapper itself never reaches
-`lastRender`, so a manifest's own author never sees it, and `assertions`
-never appears in what gets written.
-
-The value can be anything — a single `assert...; value` expression, or an
-object combining several named checks so a failure names which one:
-
-```jsonnet
-{
-	assertions:: {
-		account: aws.assertIdentity('arn:aws:iam::123456789012:user/you'),
-		project: gcp.assertProject('my-project-1234'),
-	},
-}
-```
 
 ## CLI
 
@@ -250,9 +215,9 @@ Two renders in the same process — two `SpellFrame`s, or the same one called
 twice without awaiting the first — never evaluate at the same time, and
 neither do their `init()` calls. Both are serialized process-wide, on
 purpose: some plugins keep state in a module-level object rather than
-per-instance (`spellcraft-aws-terraform`'s `projectName`, set by `bootstrap()`
+per-instance (`plugins.aws.terraform`'s `projectName`, set by `bootstrap()`
 and read by every later `getArtifact()`/`putArtifact()` call, is one case;
-`spellcraft-gcp-auth` handing its resolved credentials to the `googleapis`
+`plugins.gcp.auth` handing its resolved credentials to the `googleapis`
 library's own global config during `init()` is a sharper one), and that state
 is shared by every `SpellFrame` that loads the plugin in the same process.
 Without serializing, two concurrent renders' — or two concurrent `init()`
@@ -271,14 +236,14 @@ against a *different* frame's resolved identity, just without ever
 overlapping in time.
 
 SpellCraft doesn't try to make that safe by making credential state per-frame.
-Instead, `spellcraft-gcp-auth` takes the position that **a process has exactly
+Instead, `plugins.gcp.auth` takes the position that **a process has exactly
 one authentication context, ever** — the first successful `init()` locks it
 in, and any later `init()` (from any frame) that would resolve to a
 *different* identity throws, before touching any credential or making any
 call, rather than silently replacing what's active. The same identity twice
 is a no-op. A spell needing a different GCP *project* under one identity uses
 `providerAliases()`; a genuinely different identity needs a separate process.
-`spellcraft-aws-terraform`/`spellcraft-gcp-terraform`'s `bootstrap()` applies
+`plugins.aws.terraform`/`plugins.gcp.terraform`'s `bootstrap()` applies
 the same rule to a spell's own project name — a second `bootstrap()` call
 with a different name in the same process throws rather than silently moving
 `getArtifact()`/`putArtifact()` to a new namespace mid-manifest.
@@ -303,7 +268,7 @@ way you would expect and bare strings do not.
 ```javascript
 frame.addExternalCode('settings', { region: 'us-east-1' });  // std.extVar('settings').region
 frame.addExternalCode('name', JSON.stringify('prod'));       // std.extVar('name') === 'prod'
-frame.addExternalCode('name', 'prod');                       // STATIC ERROR: Unknown variable: prod
+frame.addExternalCode('name', 'prod');                       // STATIC ERROR -- read as Jsonnet code
 ```
 
 Native function results are memoised per `(name, arguments)` for the life of a
@@ -330,8 +295,8 @@ work actually happening, not the number of call sites.
 
 `emitAsync(event, ...args)` awaits each listener in turn, which is how plugins
 order work across packages that know nothing about one another —
-`@c6fc/spellcraft-terraform` emits `@c6fc/spellcraft-terraform:pre-apply` before
-`terraform apply`, and `@c6fc/spellcraft-gcp-terraform` listens on it to enable
+`plugins.terraform` emits `@c6fc/spellcraft-plugins:terraform.pre-apply` before
+`terraform apply`, and `plugins.gcp.terraform` listens on it to enable
 the GCP services the rendered configuration needs first.
 
 ## Writing a plugin
@@ -350,15 +315,33 @@ and in [create-spellcraft-module](https://www.npmjs.com/package/create-spellcraf
 
 ## Plugins
 
-| Package | Description |
+[**@c6fc/spellcraft-plugins**](https://www.npmjs.com/package/@c6fc/spellcraft-plugins)
+is one package whose Jsonnet surface is a tree, reached through a single import:
+
+```jsonnet
+local plugins = import "@c6fc/spellcraft-plugins/module.libsonnet";
+
+{
+	"backend.tf.json": plugins.aws.terraform.bootstrap("my-project"),
+	"buckets.tf.json": plugins.aws.terraform.s3.bucket("artifacts", "us-west-2"),
+}
+```
+
+| Node | Description |
 |---|---|
-| [**@c6fc/spellcraft-aws-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-auth) | AWS credentials, role chaining, and the AWS SDK reachable from Jsonnet. |
-| [**@c6fc/spellcraft-gcp-auth**](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-auth) | GCP credentials and the googleapis client reachable from Jsonnet. |
-| [**@c6fc/spellcraft-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-terraform) | Provider-neutral Terraform lifecycle: owns `terraform-apply` and its events. |
-| [**@c6fc/spellcraft-aws-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-terraform) | S3 state backend, remote state, and artifact storage for Terraform. |
-| [**@c6fc/spellcraft-gcp-terraform**](https://www.npmjs.com/package/@c6fc/spellcraft-gcp-terraform) | GCS state backend, remote state, artifacts, and org/project bootstrapping. |
-| [**@c6fc/spellcraft-aws-s3**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-s3) | Secure-by-default S3 bucket factory, pure Jsonnet. |
-| [**@c6fc/spellcraft-aws-lambda**](https://www.npmjs.com/package/@c6fc/spellcraft-aws-lambda) | Lambda function factory, pure Jsonnet. |
+| `plugins.aws.auth` | AWS credentials, role chaining, and the AWS SDK reachable from Jsonnet. |
+| `plugins.gcp.auth` | GCP credentials and the googleapis client reachable from Jsonnet. |
+| `plugins.terraform` | Provider-neutral Terraform lifecycle: owns `terraform-apply` and its events. |
+| `plugins.aws.terraform` | S3 state backend, remote state, and artifact storage for Terraform. |
+| `plugins.gcp.terraform` | GCS state backend, remote state, artifacts, and org/project bootstrapping. |
+| `plugins.aws.terraform.s3` | Secure-by-default S3 bucket factory, pure Jsonnet. |
+| `plugins.aws.terraform.lambda` | Lambda function factory, pure Jsonnet. |
+| `plugins.utils.tree` | Nested structure to flat configuration in one pass, pure Jsonnet. |
+| `plugins.utils.merge` | Deep merge without `std.mergePatch`'s cost, pure Jsonnet. |
+
+These were seven separately versioned packages until they were collapsed into
+one — they depended on each other's internals and always shipped together, so
+the independence was nominal. The old packages are deprecated on npm.
 
 ## License
 

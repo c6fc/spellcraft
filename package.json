@@ -7,7 +7,7 @@
   },
   "name": "@c6fc/spellcraft",
   "description": "Extensible JSonnet CLI platform",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "src/index.js",
   "directories": {
     "lib": "lib"
@@ -16,6 +16,7 @@
     "bin",
     "lib",
     "src",
+    "CHANGELOG.md",
     "LICENSE",
     "README.md"
   ],
@@ -41,5 +42,8 @@
   "bugs": {
     "url": "https://github.com/c6fc/spellcraft/issues"
   },
-  "homepage": "https://github.com/c6fc/spellcraft#readme"
+  "homepage": "https://github.com/c6fc/spellcraft#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }

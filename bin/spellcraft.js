@@ -36,11 +36,13 @@ const spellframe = new SpellFrame();
                 }).option('skip-module-cleanup', {
                     alias: 's',
                     type: 'boolean',
-                    description: 'Leave temporary modules intact after rendering'
+                    description: 'Keep the generated spellcraft_modules aggregate (.spellcraft/modules) for inspection'
                 });
             },
             async (argv) => {
-                if (argv['s']) {
+                // Read by its own name rather than the alias, so renaming the
+                // alias cannot quietly disable it.
+                if (argv['skip-module-cleanup']) {
                     sfInstance.cleanModulesAfterRender = false;
                 }
 
@@ -58,23 +60,59 @@ const spellframe = new SpellFrame();
             });
         }
 
-        cli
+        return cli
             .demandCommand(1, 'You need to specify a command.')
             .recommendCommands()
             .strict()
             .showHelpOnFail(true)
             .help("help")
             .alias('h', 'help')
-            .version()
+            // Pinned, not guessed. yargs' bare .version() walks up from wherever
+            // *yargs itself* resolved to and takes the first package.json outside
+            // node_modules -- which in any consumer project is the consumer's own
+            // package.json, so `spellcraft --version` reported the user's project
+            // version rather than SpellCraft's. (Under the dev workspace it
+            // reported the overlay's 0.0.0, which is how it was spotted.)
+            .version(require('../package.json').version)
             .alias('v', 'version')
             .epilogue('For more information, consult the SpellCraft documentation.')
-            .argv;
+
+            // yargs routes two unrelated things through .fail(): a usage error it
+            // detected itself (`msg`), and an error thrown by a command handler
+            // (`err`). They want opposite treatment.
+            //
+            // The exit code was never the problem -- Node makes an unhandled
+            // rejection fatal, so a failing command already exited 1. What a user
+            // saw was the wrong thing entirely: the command's own help text, then
+            // a raw stack trace, and no clear statement of what went wrong. A
+            // .fail() that prints and returns instead of rethrowing swaps that for
+            // the message printed twice, which is not much better.
+            .fail((msg, err, yargsInstance) => {
+
+                // A handler threw. Rethrow so parseAsync()'s rejection carries it
+                // to the catch below, which reports it and sets the exit code.
+                if (err) throw err;
+
+                // A usage error. A custom .fail() replaces showHelpOnFail, so
+                // print the help it would have printed -- .recommendCommands()
+                // puts its "did you mean" suggestion in `msg`.
+                yargsInstance.showHelp();
+                console.error(`\n[!] ${msg}`.red);
+                process.exit(1);
+            })
+
+            // parseAsync, not .argv: command handlers are async, and .argv gives
+            // no promise to await, so a handler's rejection escaped this function
+            // entirely. The try/catch below could only ever catch synchronous
+            // setup errors, which is why a failing command used to print yargs'
+            // raw stack trace under the command's own help text.
+            .parseAsync();
     }
 
     try {
-        setupCli(spellframe);
+        await setupCli(spellframe);
     } catch (error) {
-        console.error(`[!] A critical error occurred: ${error.message}`);
+        console.error(`[!] ${error.message}`.red);
         process.exit(1);
     }
 })();

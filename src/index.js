@@ -40,8 +40,8 @@ const defaultFileHandler = verbatim;
 // read back live on every request. Either way, the state is shared by every
 // SpellFrame that loads the plugin in this process, so two renders running at
 // the same time can interleave their writes to it -- not a Jsonnet-laziness
-// ordering hazard within one render, which is what `assertions::` and
-// explicit data-dependencies address, but genuine cross-render contamination.
+// ordering hazard within one render, which explicit data-dependencies address,
+// but genuine cross-render contamination.
 // Confirmed directly: two frames racing `init()` alone -- before either one's
 // Jsonnet evaluation even starts -- can leave a frame authenticated as the
 // *other* frame's identity, silently.
@@ -93,6 +93,13 @@ function nodeModulesPaths(from) {
         current = parent;
     }
 }
+
+// What makes a dependency a plugin. Shared, because the two discovery paths --
+// loadPluginsFromDependencies() for the consumer's own dependencies and
+// loadPluginsRecursively() for a plugin's -- had drifted: only the first honoured
+// the keyword, so a keyword-only plugin was loaded at the top level and then
+// never recursed into, and its own plugin dependencies went missing.
+const isPlugin = (pkg) => Boolean(pkg?.spellcraft || pkg?.keywords?.includes("spellcraft-module"));
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 
@@ -211,6 +218,17 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
             baseDir: process.cwd(),
             renderPath: "./render",
             cleanBeforeRender: true,
+
+            // Whether to remove the generated spellcraft_modules aggregate once
+            // evaluation is done. It is a build artifact of the render, not
+            // something to leave lying in the project -- but it is also the only
+            // place you can see what `spellcraft_modules/*.js` actually turned
+            // into, which is what you want when one of them failed to load. Core
+            // only *warns* on a module that throws, so the visible symptom is a
+            // manifest failing with `field does not exist: <name>` and the
+            // aggregate is where you find out why. Hence --skip-module-cleanup.
+            cleanModulesAfterRender: true,
+
             useDefaultFileHandlers: true
         };
 
@@ -247,10 +265,17 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         this.addNativeFunction("envvar", (name) => process.env[name] || false, "name");
         this.addNativeFunction("path", () => this.activePath || process.cwd());
 
-        // REFACTOR: Automatically find and register plugins from package.json
         this.loadPluginsFromDependencies();
         this.loadPluginsRecursively(this.baseDir);
-        this.validatePluginRequirements();
+        // Collected, not thrown. This used to throw from the constructor, which
+        // runs before yargs has done anything -- so a project with one plugin
+        // missing a dependency could not run `spellcraft --help` or
+        // `spellcraft doc` to find out what it had, only a stack trace. The
+        // commands that don't render are exactly the ones you want working while
+        // you sort out an install. init() raises it instead, so anything that
+        // actually evaluates a manifest still fails, and fails with the same
+        // message.
+        this.pluginRequirementErrors = this.validatePluginRequirements();
 
         // 2. Load Local Magic Modules (Rapid Prototyping Mode)
         this.loadLocalMagicModules();
@@ -290,12 +315,20 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     addNativeFunction(name, func, ...parameters) {
         this.jsonnet.nativeCallback(name, (...args) => {
             const key = this._generateCacheKey(name, args);
+
+            // Emitted before the cache check, so a listener sees every call.
+            // Below the check it only ever fired the first time a given
+            // (name, args) pair was seen -- which made the documented
+            // "<plugin>:<fn>" event useless for anything counting or tracing
+            // calls, and silently so.
+            this.emit(name, ...args);
+
             if (this._cache[key] !== undefined) {
                 return this._cache[key];
             }
+
             const result = func.apply(this.functionContext, args);
             this._cache[key] = result;
-            this.emit(name, ...args);
             return result;
         }, ...parameters);
         return this;
@@ -337,6 +370,11 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         await serialized(async () => {
             if (this.isInitialized) return;
 
+            // Raised here as well as before evaluation, so a broken install
+            // fails before any plugin's init hook does work -- authenticating,
+            // say -- for a plugin set that was never satisfied.
+            this.assertPluginRequirements();
+
             for (const step of this.initFn) {
                 await step(this);
             }
@@ -369,7 +407,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 const depDir = path.dirname(depPackageJsonPath);
 
                 // 3. Check for SpellCraft metadata
-                if (depPkg.spellcraft || depPkg.keywords?.includes("spellcraft-module")) {
+                if (isPlugin(depPkg)) {
                     const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
 
                     // 4. Load the plugin using the calculated absolute path
@@ -390,6 +428,10 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         const localModulesDir = path.join(this.baseDir, 'spellcraft_modules');
         const generatedDir = path.join(this.baseDir, '.spellcraft');
         const aggregateFile = path.join(generatedDir, 'modules');
+
+        // Recorded rather than recomputed, so cleanModules() removes exactly what
+        // was written and nothing else that may live in .spellcraft/.
+        this.generatedModulePath = aggregateFile;
 
         if (!fs.existsSync(localModulesDir)) {
             // Clean up if it exists so imports fail gracefully if folder is deleted
@@ -456,6 +498,18 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         fs.writeFileSync(aggregateFile, finalContent, 'utf-8');
     }
 
+    // Removes the generated module aggregate. The containing .spellcraft/
+    // directory stays: it is on the Jsonnet search path, added once at
+    // construction, and a directory that comes and goes between renders is a
+    // worse problem than an empty one.
+    cleanModules() {
+        if (!this.generatedModulePath) return false;
+        if (!fs.existsSync(this.generatedModulePath)) return false;
+
+        fs.unlinkSync(this.generatedModulePath);
+        return true;
+    }
+
     loadPlugin(packageName, jsMainPath) {
         if (!jsMainPath || !fs.existsSync(jsMainPath)) return;
 
@@ -512,13 +566,10 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 return;
             }
 
-            // REGISTER WITH NAMESPACE
-            // This is the key fix. We prefix the function name with the package name.
+            // Namespaced by the package, so two plugins exporting the same name
+            // do not collide in the one flat native namespace core registers into.
             const uniqueId = `${packageName}:${key}`;
             this.addNativeFunction(uniqueId, func, ...params);
-
-            // Optional: Log debug info
-            // console.log(`[+] Registered native function: ${uniqueId}`);
         });
     }
 
@@ -556,9 +607,14 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 const depPkg = require(depManifestPath);
 
                 // 3. Check if it is a SpellCraft module
-                if (depPkg.spellcraft) {
+                if (isPlugin(depPkg)) {
 
                     // A. Load the Plugin Logic
+                    //
+                    // Keyed on depPkg.name, while loadPluginsFromDependencies()
+                    // keys on the dependency name as written. Those differ when a
+                    // package is installed under an npm alias, and the natives a
+                    // plugin registers are named after whichever key reached it.
                     const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
                     this.loadPlugin(depPkg.name, jsMainPath);
 
@@ -567,46 +623,47 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                     this.loadPluginsRecursively(depDir);
                 }
             } catch (e) {
-                // Dependency might be optional or failed to resolve; skip gracefully
-                // console.warn(`Debug: Skipped ${depName} from ${currentDir}: ${e.message}`);
+                // Most dependencies aren't plugins, and some don't expose their
+                // package.json through 'exports' at all. Neither is worth reporting.
+                // Set SPELLCRAFT_DEBUG to see what was skipped.
+                if (process.env.SPELLCRAFT_DEBUG) {
+                    console.warn(`Debug: Skipped ${depName} from ${currentDir}: ${e.message}`);
+                }
             }
         });
     }
 
-    // Both render() and renderString() funnel through here so a hidden
-    // top-level `assertions::` field is guaranteed to run before anything is
-    // written -- the conventional place for a manifest to put an
-    // aws.assertIdentity()/gcp.assertProject() style guard.
-    //
-    // Hidden fields are invisible to manifestation: Jsonnet only walks and
-    // serialises visible ones, so a lazy `assertions::` field only ever ran if
-    // its value happened to be threaded into something visible too (returning
-    // it into `allowed_account_ids`, say). Get that threading wrong -- the
-    // easier mistake -- and the guard fails open, silently, which is the one
-    // thing an assertion must never do.
-    //
-    // The fix doesn't need Jsonnet to do anything it doesn't already do: read
-    // the hidden field through a *visible* field of a throwaway wrapper
-    // object, and let ordinary manifestation force it, the same way it forces
-    // every other visible field. A failing `assert` inside `assertions::`
-    // throws while that wrapper is being manifested, before a single file is
-    // written -- and the wrapper itself is discarded here, so a manifest's own
-    // author never sees it.
+    // Both render() and renderString() funnel through here, so anything that
+    // has to hold for every evaluation belongs in one place.
     async evaluateManifestExpression(expression) {
-        const wrapper = `local __spellcraft_manifest__ = (${expression});\n` +
-            `{\n` +
-            `    manifest: __spellcraft_manifest__,\n` +
-            `    assertions: if std.isObject(__spellcraft_manifest__) && std.objectHasAll(__spellcraft_manifest__, "assertions")\n` +
-            `        then __spellcraft_manifest__.assertions\n` +
-            `        else null,\n` +
-            `}`;
+        // Regenerated per evaluation, not once at construction. Cleanup deletes
+        // the aggregate, so a second render on the same frame would otherwise
+        // evaluate against a file that is no longer there. It already busts its
+        // own require cache, so re-running it also picks up a module edited
+        // between renders -- which is what a long-lived frame wants anyway.
+        this.loadLocalMagicModules();
 
-        // Serialized process-wide -- see the comment on executionQueue for why.
-        const evaluated = await serialized(async () => {
-            return JSON.parse(await this.jsonnet.evaluateSnippet(wrapper));
-        });
+        // The native memo cache belongs to one evaluation, not to the frame.
+        // Within an evaluation it is load-bearing -- gcp.terraform's
+        // googleOrgProject() is unusable without it -- but carrying it across
+        // renders means a second render on a reused frame replays the first
+        // one's answers, including whatever a live API said some time ago.
+        // Invisible from the CLI, which builds one frame and renders once; a
+        // correctness bug for anything embedding SpellFrame as a library.
+        this._cache = {};
 
-        return evaluated.manifest;
+        try {
+            // Serialized process-wide -- see the comment on executionQueue for why.
+            return await serialized(async () => {
+                return JSON.parse(await this.jsonnet.evaluateSnippet(expression));
+            });
+        } finally {
+            // In a finally, so a failed evaluation cleans up after itself too --
+            // otherwise the one run most likely to leave an artifact behind is
+            // the one that errored. Re-run with --skip-module-cleanup to keep it
+            // and read it; that is what the flag is for.
+            if (this.cleanModulesAfterRender) this.cleanModules();
+        }
     }
 
     async render(file) {
@@ -615,10 +672,16 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
             await this.init();
         }
 
+
         const absoluteFilePath = path.resolve(file);
         if (!fs.existsSync(absoluteFilePath)) {
             throw new Error(`SpellCraft Render Error: Input file ${absoluteFilePath} does not exist.`);
         }
+
+        // Checked outside the try below: an unsatisfied plugin requirement is a
+        // precondition, and wrapping it as a Jsonnet evaluation error sends you to
+        // inspect a manifest that is fine.
+        this.assertPluginRequirements();
 
         this.activePath = path.dirname(absoluteFilePath);
 
@@ -639,6 +702,11 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
 
     async renderString(snippet) {
 
+        // See render(): a precondition, not an evaluation failure. renderString()
+        // reaches Jsonnet without going through render() or init(), so it has to
+        // ask for itself.
+        this.assertPluginRequirements();
+
         this.activePath = process.cwd();
 
         try {
@@ -651,13 +719,25 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         return this.lastRender;
     }
 
+    // Raised at init() and before every evaluation, never from the constructor.
+    // See the constructor's call site for why.
+    assertPluginRequirements() {
+        if (this.pluginRequirementErrors?.length > 0) {
+            throw new Error(this.pluginRequirementErrors.join('\n'));
+        }
+    }
+
+    // Returns the problems rather than throwing them; the constructor stores
+    // them and the two entry points above raise. See the call site for why.
     validatePluginRequirements() {
+        const errors = [];
+
         for (const [pluginName, data] of this.loadedPlugins.entries()) {
             if (!data.requires || data.requires.length === 0) continue;
 
             data.requires.forEach(req => {
                 if (!this.loadedPlugins.has(req)) {
-                    throw new Error(
+                    errors.push(
                         `[SpellCraft Dependency Error] The module '${pluginName}' requires '${req}', ` +
                         `but '${req}' was not found or failed to load. \n` +
                         `    -> Try running: npm install --save ${req}`
@@ -665,6 +745,35 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 }
             });
         }
+
+        return errors;
+    }
+
+    // Resolves a manifest key to the file it names, and refuses anything that
+    // would land outside renderPath.
+    //
+    // The manifest contract is "filename -> content, inside renderPath", and this
+    // is what enforces it. A key only has to contain '..' to escape -- and the
+    // escape is the smaller half of the problem, because the key is then recorded
+    // in the render manifest, so the *next* run's clean resolves the same '..'
+    // and deletes a file that was never SpellCraft's to write or remove.
+    //
+    // Anything genuinely outside renderPath -- a file mode, a path elsewhere on
+    // disk, a value that does not exist until apply -- is Terraform's job, via a
+    // local_file resource. That is the supported route and the error says so.
+    resolveRenderedPath(filename) {
+        const root = path.resolve(this.renderPath);
+        const target = path.resolve(root, filename);
+
+        if (target !== root && !target.startsWith(root + path.sep)) {
+            throw new Error(
+                `SpellCraft Write Error: "${filename}" resolves outside ${this.renderPath}. ` +
+                `A manifest writes files inside the render directory only; to write elsewhere, ` +
+                `or to set a file mode, use a Terraform local_file resource.`
+            );
+        }
+
+        return target;
     }
 
     // Where write() stashes the list of filenames it produced last time, so a
@@ -719,11 +828,21 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         previous.forEach(filename => this.removeRenderedFile(filename));
     }
 
-    // Unlike the try{}catch(e){} this replaces, failures and removals are both
-    // reported rather than swallowed -- nothing here should be a silent
-    // no-op.
+    // Failures and removals are both reported rather than swallowed
+    // nothing here should be a silent no-op.
     removeRenderedFile(filename) {
-        const filePath = path.join(this.renderPath, filename);
+        let filePath;
+
+        try {
+            // A manifest left by an older version can name a path outside
+            // renderPath, from before write() refused those. Report and skip it:
+            // deleting is the half that destroys something.
+            filePath = this.resolveRenderedPath(filename);
+        } catch (e) {
+            console.warn(`  [!] Refusing to remove ${filename}: it resolves outside ${this.renderPath}`);
+            return;
+        }
+
         if (!fs.existsSync(filePath)) return;
 
         try {
@@ -735,7 +854,30 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     }
 
     write(filesToWrite = this.lastRender) {
-        if (!filesToWrite || typeof filesToWrite !== 'object') return this;
+        // A manifest is an object of filename -> content. An array passes a bare
+        // `typeof === 'object'` and would be walked by index, producing files
+        // called "0" and "1"; anything else wrote nothing at all and said nothing.
+        // Both are worth naming rather than half-doing.
+        if (filesToWrite === null || typeof filesToWrite !== 'object' || Array.isArray(filesToWrite)) {
+            const what = Array.isArray(filesToWrite) ? 'an array' : `a ${typeof filesToWrite}`;
+            throw new Error(
+                `SpellCraft Write Error: a manifest must evaluate to an object of ` +
+                `filename -> content, but this one produced ${what}.`
+            );
+        }
+
+        // Every key is resolved before anything is written *or cleaned*, so a
+        // manifest naming a path outside renderPath leaves the previous render
+        // exactly as it was: a run that refuses to write should not have already
+        // deleted what it was replacing.
+        //
+        // Doing it here also keeps the error intact. Raised inside the per-file
+        // catch below, it would be folded into the generic "could not be written"
+        // summary, losing the part that says what to do instead.
+        const names = Object.keys(filesToWrite).filter(
+            (filename) => Object.prototype.hasOwnProperty.call(filesToWrite, filename),
+        );
+        const targets = new Map(names.map((filename) => [filename, this.resolveRenderedPath(filename)]));
 
         if (!fs.existsSync(this.renderPath)) {
             fs.mkdirSync(this.renderPath, { recursive: true });
@@ -747,19 +889,26 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
 
         console.log(`[+] Writing files to: ${this.renderPath}`);
         const written = [];
-        for (const filename in filesToWrite) {
-            if (Object.prototype.hasOwnProperty.call(filesToWrite, filename)) {
-                const outputFilePath = path.join(this.renderPath, filename);
-                const [, handlerFn] = Object.entries(this.fileTypeHandlers)
-                    .find(([pattern]) => new RegExp(pattern).test(filename)) || [null, defaultFileHandler];
+        const failed = [];
 
-                try {
-                    fs.writeFileSync(outputFilePath, handlerFn(filesToWrite[filename]), 'utf-8');
-                    console.log('  -> ' + path.basename(outputFilePath));
-                    written.push(filename);
-                } catch (e) {
-                    console.error(`  [!] Error writing ${filename}: ${e.message}`);
-                }
+        for (const filename of names) {
+            const [, handlerFn] = Object.entries(this.fileTypeHandlers)
+                .find(([pattern]) => new RegExp(pattern).test(filename)) || [null, defaultFileHandler];
+
+            try {
+                const outputFilePath = targets.get(filename);
+
+                // A key may name a subdirectory. Terraform only reads files
+                // directly in render/, but nothing else does, and the render
+                // manifest itself already nests.
+                fs.mkdirSync(path.dirname(outputFilePath), { recursive: true });
+
+                fs.writeFileSync(outputFilePath, handlerFn(filesToWrite[filename]), 'utf-8');
+                console.log('  -> ' + filename);
+                written.push(filename);
+            } catch (e) {
+                console.error(`  [!] Error writing ${filename}: ${e.message}`);
+                failed.push(filename);
             }
         }
 
@@ -768,6 +917,17 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         // doesn't get "cleaned" as if it were stale next run.
         fs.mkdirSync(path.dirname(this.manifestPath), { recursive: true });
         fs.writeFileSync(this.manifestPath, JSON.stringify(written, null, 4), 'utf-8');
+
+        // Raised after the manifest is written, so what did land is still
+        // recorded and cleanable. A partial write is a failed run: reporting it
+        // as success is how a caller ends up applying a configuration with a file
+        // missing from it.
+        if (failed.length > 0) {
+            throw new Error(
+                `SpellCraft Write Error: ${failed.length} of ${written.length + failed.length} ` +
+                `files could not be written: ${failed.join(', ')}`
+            );
+        }
 
         this.emit('write', filesToWrite);
         return this;

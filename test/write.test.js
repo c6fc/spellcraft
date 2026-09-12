@@ -146,8 +146,13 @@ test('the manifest only records files that were actually written', () => {
 	const frame = new SpellFrame({ renderPath });
 
 	frame.addFileTypeHandler('.*?\\.broken$', () => { throw new Error('handler always fails'); });
-	frame.write({ 'ok.md': 'fine', 'bad.broken': 'never lands' });
+
+	// A partial write is a failed run -- but the manifest still has to record
+	// what did land, or the next clean cannot remove it. Both halves matter, and
+	// the throw comes after the manifest is written for exactly that reason.
+	assert.throws(() => frame.write({ 'ok.md': 'fine', 'bad.broken': 'never lands' }), /bad\.broken/);
 
 	const manifest = JSON.parse(fs.readFileSync(frame.manifestPath, 'utf-8'));
 	assert.deepEqual(manifest, ['ok.md']);
+	assert.equal(fs.readFileSync(path.join(renderPath, 'ok.md'), 'utf-8'), 'fine');
 });

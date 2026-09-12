@@ -136,8 +136,16 @@ class DocGenerator {
     }
 
     parseCliDocs() {
-        const jsPath = path.join(this.baseDir, 'module.js');
-        if (!fs.existsSync(jsPath)) return '';
+        // A plugin's entry point is conventionally module.js, but it is whatever
+        // its package.json calls `main` -- and a package built as a tree of nodes
+        // (see @c6fc/spellcraft-plugins) gives each node its own index.js, with
+        // module.js nowhere in sight. Looking only for module.js silently emptied
+        // the CLI section of every such node's README instead of documenting it.
+        const jsPath = ['module.js', 'index.js']
+            .map((name) => path.join(this.baseDir, name))
+            .find((candidate) => fs.existsSync(candidate));
+
+        if (!jsPath) return '';
 
         try {
             // Load the module (Bypass cache to ensure fresh read)
@@ -204,7 +212,7 @@ class DocGenerator {
             return markdown;
 
         } catch (e) {
-            console.warn(`[!] Failed to parse CLI docs from module.js: ${e.message}`);
+            console.warn(`[!] Failed to parse CLI docs from ${path.basename(jsPath)}: ${e.message}`);
             return '';
         }
     }
