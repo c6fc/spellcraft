@@ -107,6 +107,32 @@ test('a manifest that renders to a scalar is refused by name', () => {
     assert.throws(() => new SpellFrame({ renderPath }).write(42), /produced a number/);
 });
 
+test('a manifest that renders to null is named as null, not as "a object"', () => {
+    const renderPath = path.join(scratch(), 'render');
+
+    // `typeof null` is "object", so this used to be reported as "a object" --
+    // the one word that makes it sound like it nearly worked. A manifest
+    // arriving here through `if enabled then {...} else null` is ordinary.
+    assert.throws(() => new SpellFrame({ renderPath }).write(null), /produced null/);
+});
+
+test('an empty key is refused rather than writing to the render directory itself', () => {
+    const renderPath = path.join(scratch(), 'render');
+
+    // "" resolves to renderPath, which the containment check permits -- it is
+    // not outside renderPath, it *is* renderPath -- so the failure was a raw
+    // EISDIR naming no file, because there is no name.
+    assert.throws(
+        () => new SpellFrame({ renderPath }).write({ '': 'what happens' }),
+        /names the file to write, and "" names none/,
+    );
+
+    assert.doesNotMatch(
+        (() => { try { new SpellFrame({ renderPath }).write({ '': 'x' }); } catch (e) { return e.message; } })(),
+        /EISDIR/,
+    );
+});
+
 test('a write that fails makes the run fail, naming the file', () => {
     const renderPath = path.join(scratch(), 'render');
     const frame = new SpellFrame({ renderPath });

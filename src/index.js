@@ -103,6 +103,43 @@ const isPlugin = (pkg) => Boolean(pkg?.spellcraft || pkg?.keywords?.includes("sp
 
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 
+// Jsonnet's own reserved words. IDENTIFIER above is a *JavaScript* identifier
+// test, and the two grammars disagree: `self`, `local`, `error`, `import` and
+// the rest are ordinary JS parameter names that a JS developer writes without a
+// second thought, and every one of them is a parse error in the generated
+// spellcraft_modules aggregate, where each parameter is declared by name.
+// Unlike a field name, a parameter cannot be quoted out of trouble -- so this is
+// the one position that has to be rejected rather than escaped.
+const JSONNET_RESERVED = new Set([
+    'assert', 'else', 'error', 'false', 'for', 'function', 'if', 'import',
+    'importbin', 'importstr', 'in', 'local', 'null', 'self', 'super',
+    'tailstrict', 'then', 'true',
+]);
+
+// Raises on any parameter name that cannot be written into the generated module.
+// Applies to inferred names and to the explicit [fn, "arg1", "arg2"] form alike
+// -- the explicit form is the documented escape hatch from inference, not from
+// Jsonnet's grammar, and it was previously unchecked in both directions.
+function assertUsableParameterNames(parameters, label, explicit = false) {
+    for (const parameter of parameters) {
+        if (typeof parameter !== 'string' || !IDENTIFIER.test(parameter)) {
+            throw new Error(
+                `[SpellCraft] Could not read the parameter names of '${label}' ('${parameter}' is not a plain name).\n` +
+                (explicit
+                    ? `    Names given as [fn, "arg1", "arg2"] are written into the generated module verbatim, so each must be a plain identifier.`
+                    : `    Export it as [fn, "arg1", "arg2"] to name its parameters explicitly.`)
+            );
+        }
+
+        if (JSONNET_RESERVED.has(parameter)) {
+            throw new Error(
+                `[SpellCraft] '${label}' has a parameter named '${parameter}', which is a Jsonnet keyword.\n` +
+                `    Rename it. The generated module declares each parameter by name, and a keyword there cannot parse.`
+            );
+        }
+    }
+}
+
 // Walks source from `start`, tracking quotes and nesting, and returns the index
 // of the delimiter that closes the one at `start`.
 function findClosingDelimiter(source, start) {
@@ -194,14 +231,7 @@ function getFunctionParameterList(func, label) {
         // to. Dropping it leaves the named leading parameters reachable.
         .filter(parameter => !parameter.startsWith('...'));
 
-    const unusable = parameters.find(parameter => !IDENTIFIER.test(parameter));
-
-    if (unusable) {
-        throw new Error(
-            `[SpellCraft] Could not read the parameter names of '${name}' ('${unusable}' is not a plain name).\n` +
-            `    Export it as [fn, "arg1", "arg2"] to name its parameters explicitly.`
-        );
-    }
+    assertUsableParameterNames(parameters, name);
 
     return parameters;
 }
@@ -244,6 +274,10 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         this.activePath = null;
         this.visitedPlugins = new Set();
         this.loadedPlugins = new Map();
+        // Keyed on the resolved real path of a plugin's entry point rather than
+        // on any name, because the two discovery paths key on different names --
+        // see loadPlugin().
+        this.loadedPluginPaths = new Map();
         this.isInitialized = false;
         this._jpaths = new Set();
 
@@ -313,6 +347,37 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     }
 
     addNativeFunction(name, func, ...parameters) {
+        // What a native hands back has to survive the trip into Jsonnet, and the
+        // bridge below us does not defend itself: a cyclic object takes the whole
+        // process down with SIGSEGV -- no exception, no message, no partial
+        // output -- and a non-finite number is written into the bridge's own
+        // output text as `nan`/`inf`, which then fails as a *JSON parse error*
+        // naming neither the native nor the number. None of these is exotic: 0/0,
+        // a BigInt from a byte count or a database driver, a cyclic object from
+        // an SDK response.
+        //
+        // One JSON.stringify pass catches all three. The replacer is doing the
+        // work for the numeric case -- JSON.stringify(NaN) is happily "null", so
+        // a check on the result alone would miss a non-finite number nested
+        // anywhere inside an object.
+        const checkReturnValue = (value) => {
+            try {
+                JSON.stringify(value, (k, v) => {
+                    if (typeof v === 'number' && !Number.isFinite(v)) {
+                        throw new TypeError(`a non-finite number (${v})`);
+                    }
+
+                    return v;
+                });
+            } catch (e) {
+                throw new Error(
+                    `[SpellCraft] native '${name}' returned a value that cannot cross into Jsonnet: ${e.message}`
+                );
+            }
+
+            return value;
+        };
+
         this.jsonnet.nativeCallback(name, (...args) => {
             const key = this._generateCacheKey(name, args);
 
@@ -328,8 +393,18 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
             }
 
             const result = func.apply(this.functionContext, args);
-            this._cache[key] = result;
-            return result;
+
+            // A promise has to be checked on what it resolves to -- the bridge
+            // awaits it, so that is the value actually crossing over, and
+            // stringifying the promise itself proves nothing. The checked
+            // promise is what gets cached, so a second call for the same
+            // arguments raises identically instead of replaying an unchecked one.
+            const checked = (result && typeof result.then === 'function')
+                ? result.then(checkReturnValue)
+                : checkReturnValue(result);
+
+            this._cache[key] = checked;
+            return checked;
         }, ...parameters);
         return this;
     }
@@ -469,6 +544,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 // Handle [func, "arg1", "arg2"] syntax or plain function
                 if (Array.isArray(moduleExports[funcName])) {
                     [func, ...params] = moduleExports[funcName];
+                    assertUsableParameterNames(params, `${file}:${funcName}`, true);
                 } else if (typeof moduleExports[funcName] === 'function') {
                     func = moduleExports[funcName];
                     params = getFunctionParameterList(func, `${file}:${funcName}`);
@@ -481,15 +557,26 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                 this.addNativeFunction(uniqueId, func, ...params);
 
                 // Create the Jsonnet wrapper string
-                // e.g. myFunc(a, b):: std.native("local_utils_myFunc")(a, b)
+                // e.g. "myFunc"(a, b):: std.native("local_utils_myFunc")(a, b)
+                //
+                // Both field names are quoted, and that is load-bearing rather
+                // than cosmetic. They are interpolated straight from the
+                // filesystem and from the module's own exports, so an ordinary
+                // `spellcraft_modules/my-utils.js` -- or an `exports["get-thing"]`
+                // -- used to emit a bare field name that is not a Jsonnet
+                // identifier, and the whole aggregate then failed to parse,
+                // taking every *other* local module in the project with it.
+                // Jsonnet accepts any string as a field name, so quoting fixes
+                // the entire class; callers reach them as m["my-utils"]["get-thing"](x),
+                // and a name that was already valid is unchanged by the quotes.
                 const paramStr = params.join(", ");
-                fileMethods.push(`    ${funcName}(${paramStr}):: std.native("${uniqueId}")(${paramStr})`);
+                fileMethods.push(`    ${JSON.stringify(funcName)}(${paramStr}):: std.native("${uniqueId}")(${paramStr})`);
             });
 
             console.log(`[+] Loaded [${Object.keys(moduleExports).join(", ")}] from [${file}].`);
 
             if (fileMethods.length > 0) {
-                jsonnetContentParts.push(`  ${moduleName}: {\n${fileMethods.join(",\n")}\n  }`);
+                jsonnetContentParts.push(`  ${JSON.stringify(moduleName)}: {\n${fileMethods.join(",\n")}\n  }`);
             }
         });
 
@@ -516,6 +603,27 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         if (this.loadedPlugins.has(packageName)) {
             return;
         }
+
+        // The name-keyed guard above is not enough. loadPluginsFromDependencies()
+        // keys on the dependency name as *written* in package.json, while
+        // loadPluginsRecursively() keys on depPkg.name -- and under an npm alias
+        // (`npm i 'myplugins@npm:@c6fc/spellcraft-plugins'`) those differ, so the
+        // same file on disk was loaded twice under two names. Measured: every
+        // init() hook ran twice per render and every yargs command was registered
+        // twice, visibly, in --help. It went unnoticed because this package's own
+        // init hooks are memoised and idempotent; one that allocates, appends or
+        // spawns gets it done twice with no indication.
+        //
+        // So dedupe on what cannot be renamed: the resolved real path of the
+        // entry point.
+        let realMainPath;
+        try {
+            realMainPath = fs.realpathSync(jsMainPath);
+        } catch (e) {
+            realMainPath = path.resolve(jsMainPath);
+        }
+
+        const alreadyLoadedAs = this.loadedPluginPaths.get(realMainPath);
 
         let moduleExports;
         try {
@@ -545,13 +653,31 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         }
 
         if (moduleExports._spellcraft_metadata) {
-            this.extendWithModuleMetadata(moduleExports._spellcraft_metadata);
+            // Only once per file. Everything this merges -- init hooks, CLI
+            // extensions, file-type handlers, functionContext -- is additive, so
+            // a second pass over the same plugin is pure duplication.
+            if (alreadyLoadedAs === undefined) {
+                this.extendWithModuleMetadata(moduleExports._spellcraft_metadata);
+            } else if (process.env.SPELLCRAFT_DEBUG) {
+                console.warn(`Debug: ${packageName} is ${alreadyLoadedAs} under another name; registering its natives only.`);
+            }
 
+            // Recorded under both names even so, so a `requires` naming either
+            // one resolves.
             this.loadedPlugins.set(packageName, {
                 name: packageName,
                 requires: moduleExports._spellcraft_metadata.requires || []
             });
         }
+
+        if (alreadyLoadedAs === undefined) {
+            this.loadedPluginPaths.set(realMainPath, packageName);
+        }
+
+        // Natives are still registered under this name, even on the second pass:
+        // the alias is what the manifest author will type, and a plugin's own
+        // module.libsonnet hardcodes the real package name, so both have to
+        // resolve.
 
         Object.keys(moduleExports).forEach(key => {
             if (key === '_spellcraft_metadata') return;
@@ -559,6 +685,7 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
             let func, params;
             if (Array.isArray(moduleExports[key])) {
                 [func, ...params] = moduleExports[key];
+                assertUsableParameterNames(params, `${packageName}:${key}`, true);
             } else if (typeof moduleExports[key] === "function") {
                 func = moduleExports[key];
                 params = getFunctionParameterList(func, `${packageName}:${key}`);
@@ -615,6 +742,10 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
                     // keys on the dependency name as written. Those differ when a
                     // package is installed under an npm alias, and the natives a
                     // plugin registers are named after whichever key reached it.
+                    // Both names therefore end up registered, deliberately;
+                    // loadPlugin() dedupes the *metadata* on the entry point's
+                    // real path so the plugin is only extended into this frame
+                    // once.
                     const jsMainPath = path.join(depDir, depPkg.main || 'index.js');
                     this.loadPlugin(depPkg.name, jsMainPath);
 
@@ -652,17 +783,32 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         // correctness bug for anything embedding SpellFrame as a library.
         this._cache = {};
 
+        // Set when the failure points *into* the generated aggregate, so the
+        // cleanup below leaves the evidence alone. See the catch for why.
+        let keepGeneratedModule = false;
+
         try {
             // Serialized process-wide -- see the comment on executionQueue for why.
             return await serialized(async () => {
                 return JSON.parse(await this.jsonnet.evaluateSnippet(expression));
             });
+        } catch (e) {
+            // A STATIC ERROR in the aggregate cites it by path and line. Deleting
+            // it on the way out means the error names a file that no longer
+            // exists by the time anyone looks -- and you have to already know
+            // --skip-module-cleanup exists to read the line you were told to read.
+            if (this.generatedModulePath && String(e?.message ?? e).includes(this.generatedModulePath)) {
+                keepGeneratedModule = true;
+                console.warn(`  [!] Kept ${this.generatedModulePath}: the error above points into it.`);
+            }
+
+            throw e;
         } finally {
             // In a finally, so a failed evaluation cleans up after itself too --
             // otherwise the one run most likely to leave an artifact behind is
             // the one that errored. Re-run with --skip-module-cleanup to keep it
             // and read it; that is what the flag is for.
-            if (this.cleanModulesAfterRender) this.cleanModules();
+            if (this.cleanModulesAfterRender && !keepGeneratedModule) this.cleanModules();
         }
     }
 
@@ -763,6 +909,19 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
     // local_file resource. That is the supported route and the error says so.
     resolveRenderedPath(filename) {
         const root = path.resolve(this.renderPath);
+
+        // "" resolves to the render directory itself, which the containment
+        // check below then permits -- it is not outside renderPath, it *is*
+        // renderPath. Writing to it can only be a mistake, and the failure it
+        // produced said so in the worst available way: a raw EISDIR naming no
+        // file, because there is no name.
+        if (filename === '') {
+            throw new Error(
+                `SpellCraft Write Error: a manifest key names the file to write, and "" names none. ` +
+                `Every top-level key of the manifest must be a filename inside ${this.renderPath}.`
+            );
+        }
+
         const target = path.resolve(root, filename);
 
         if (target !== root && !target.startsWith(root + path.sep)) {
@@ -859,7 +1018,13 @@ exports.SpellFrame = class SpellFrame extends EventEmitter {
         // called "0" and "1"; anything else wrote nothing at all and said nothing.
         // Both are worth naming rather than half-doing.
         if (filesToWrite === null || typeof filesToWrite !== 'object' || Array.isArray(filesToWrite)) {
-            const what = Array.isArray(filesToWrite) ? 'an array' : `a ${typeof filesToWrite}`;
+            // `typeof null` is "object", so null used to be reported as "a
+            // object" -- the one word that makes it sound like it nearly worked,
+            // for a manifest that reached here through `if enabled then {...}
+            // else null`. Named outright instead.
+            const what = filesToWrite === null
+                ? 'null'
+                : (Array.isArray(filesToWrite) ? 'an array' : `a ${typeof filesToWrite}`);
             throw new Error(
                 `SpellCraft Write Error: a manifest must evaluate to an object of ` +
                 `filename -> content, but this one produced ${what}.`

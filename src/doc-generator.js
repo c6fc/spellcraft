@@ -51,12 +51,27 @@ class DocGenerator {
         // '::', rather than to the first ')' encountered — a default value may
         // call a function, as in `api(path, params={ project: getProjectId() })`,
         // and stopping at the first ')' truncated the signature mid-way.
-        const regex = /\/\*\*([\s\S]*?)\*\/\s*\n\s*([\w]+)\(([\s\S]*?)\)\s*::?(?!:)/g;
-        
+        //
+        // The comment capture is bounded so it cannot cross a '*/'. It used to be
+        // a plain lazy `([\s\S]*?)`, which is lazy but unbounded: when the member
+        // following a doc comment has no parentheses -- a documented constant,
+        // `version:: "1.0.0"` -- the match could not complete there, so the engine
+        // extended the *comment* past its own terminator until it found a member
+        // that did have them. Two members then collapsed into one entry, with the
+        // raw Jsonnet source between them printed as documentation prose, in a
+        // README that then gets published. Bounded, a doc comment with no
+        // function after it simply does not match, and is reported below.
+        const regex = /\/\*\*((?:(?!\*\/)[\s\S])*?)\*\/\s*\n\s*([\w]+)\(([\s\S]*?)\)\s*::?(?!:)/g;
+
         let match;
         let markdown = "## API Reference\n\n";
 
+        // Where each documented member's comment began, so the ones that matched
+        // nothing can be named afterwards.
+        const documented = new Set();
+
         while ((match = regex.exec(content)) !== null) {
+            documented.add(match.index);
             const rawCommentLines = match[1].split('\n').map(line => 
                 // Remove the "   * " from the start of lines
                 line.replace(/^\s*\*\s?/, '')
@@ -132,6 +147,35 @@ class DocGenerator {
 
             markdown += "---\n";
         }
+
+        // A doc comment that documented nothing. Before the capture was bounded
+        // this was silent *and* corrupting; now it is merely silent, which is
+        // still how a convention ends up as folklore -- the plugin tree works
+        // around it by writing line comments on parenless members, and nothing
+        // tells the next author that rule exists.
+        const anyDocComment = /\/\*\*(?:(?!\*\/)[\s\S])*?\*\//g;
+        let stray;
+
+        while ((stray = anyDocComment.exec(content)) !== null) {
+            if (documented.has(stray.index)) continue;
+
+            const before = content.slice(0, stray.index);
+
+            // A '/**' written inside a line comment is prose about doc comments,
+            // not one. This scan is a plain regex with no idea what it is reading
+            // -- the same limitation the native-reference scanner has -- and the
+            // text most likely to mention '/** */' is a comment explaining when
+            // not to use one.
+            if (/\/\/[^\n]*$/.test(before)) continue;
+
+            const line = before.split('\n').length;
+            console.warn(
+                `[-] Skipped the doc comment at ${path.basename(libPath)}:${line} -- ` +
+                `no function follows it. Only members with parentheses are documented; ` +
+                `use a // line comment for anything else.`
+            );
+        }
+
         return markdown;
     }
 

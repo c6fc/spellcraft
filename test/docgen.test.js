@@ -109,3 +109,59 @@ test('documents CLI commands from an index.js entry point', () => {
 	assert.match(readme, /do-a-thing <name>/);
 	assert.match(readme, /Does a thing/);
 });
+
+test('a doc comment with no function after it does not swallow the source', () => {
+	// The comment capture was lazy but *unbounded*, so it did not stop at '*/'.
+	// A documented member with no parentheses -- an ordinary constant -- could
+	// not complete the match there, so the engine extended the comment past its
+	// own terminator to the next member that did have them. Two members then
+	// collapsed into one entry, with the raw Jsonnet between them printed as
+	// documentation prose, into a README that gets published.
+	const readme = generateFrom(`{
+	/**
+	 * A documented constant.
+	 * @returns {string} the version
+	 */
+	version:: "1.0.0",
+
+	/**
+	 * Greets someone.
+	 * @param {string} who - the name
+	 * @returns {string} a greeting
+	 */
+	greet(who):: "hello %s" % who,
+}`);
+
+	assert.match(readme, /### `greet\(who\)`/);
+	assert.match(readme, /Greets someone\./);
+
+	// None of the constant's source, and none of its @returns, attributed to greet.
+	assert.doesNotMatch(readme, /version:: "1\.0\.0"/);
+	assert.doesNotMatch(readme, /A documented constant/);
+	assert.doesNotMatch(readme, /the version/);
+});
+
+test('the skipped doc comment is reported, with a line number', () => {
+	const said = [];
+	const warn = console.warn;
+	console.warn = (message) => said.push(String(message));
+
+	try {
+		generateFrom(`{
+	/**
+	 * A documented constant.
+	 */
+	version:: "1.0.0",
+}`);
+	} finally {
+		console.warn = warn;
+	}
+
+	// Otherwise the convention stays folklore: the plugin tree already works
+	// around this by writing line comments on parenless members, and nothing
+	// tells the next author that rule exists.
+	assert.ok(
+		said.some((line) => /Skipped the doc comment at module\.libsonnet:2/.test(line)),
+		`nothing was reported:\n${said.join('\n')}`
+	);
+});

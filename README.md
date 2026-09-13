@@ -176,6 +176,18 @@ spellcraft doc                   Regenerate this package's README API reference
 spellcraft --help                List every command, plugins included
 ```
 
+`generate` takes the same external-variable flags `jsonnet(1)` does, bound to
+`std.extVar`, each repeatable:
+
+```
+spellcraft generate main.jsonnet --ext-str stage=prod --ext-code replicas=2+1
+```
+
+`--ext-str` binds a string; `--ext-code` binds a Jsonnet expression. The
+difference matters — the value of `--ext-code` is evaluated as code, so
+`--ext-code stage=prod` fails with an unknown variable where `--ext-str` would
+have given you the string.
+
 Plugins extend the CLI, so `--help` differs between projects. `spellcraft doc`
 reads the doc comments in a plugin's `module.libsonnet` and the commands it
 registers, then replaces the content between marker comments in `README.md`:

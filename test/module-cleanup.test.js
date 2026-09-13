@@ -55,7 +55,9 @@ test('cleanModulesAfterRender: false keeps it, with the real content', async () 
     await frame.renderString('{ said: (import "modules").greeter.greet() }');
 
     assert.strictEqual(aggregateExists(dir), true, 'the flag did not keep the aggregate');
-    assert.match(fs.readFileSync(path.join(dir, AGGREGATE), 'utf8'), /greet\(\):: std\.native/);
+    // Field names are quoted -- see loadLocalMagicModules() for why that is
+    // load-bearing rather than cosmetic.
+    assert.match(fs.readFileSync(path.join(dir, AGGREGATE), 'utf8'), /"greet"\(\):: std\.native/);
 });
 
 test('a second render on the same frame still works after a clean', async () => {

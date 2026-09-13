@@ -8,7 +8,21 @@ const { hideBin } = require('yargs/helpers');
 const { SpellFrame } = require('../src/index.js');
 const DocGenerator = require('../src/doc-generator');
 
-const spellframe = new SpellFrame();
+
+// --ext-str / --ext-code take `name=value`, the same spelling jsonnet(1) uses.
+// Only the first '=' separates: a value may contain as many as it likes.
+function parseExternalAssignments(values, flag) {
+    return (Array.isArray(values) ? values : []).map((entry) => {
+        const text = String(entry);
+        const split = text.indexOf('=');
+
+        if (split < 1) {
+            throw new Error(`--${flag} takes name=value; '${text}' has no name.`);
+        }
+
+        return [text.slice(0, split), text.slice(split + 1)];
+    });
+}
 
 (async () => {
     function setupCli(sfInstance) {
@@ -16,11 +30,14 @@ const spellframe = new SpellFrame();
             .usage("Syntax: $0 <command> [options]")
             .scriptName("spellcraft")
 
-            .command("*", false, (yargsInstance) => { // 'false' for no yargs description
-                return yargsInstance;
-            }, (argv) => {
-                console.log("[~] That's too arcane. (Unrecognized command)");
-            })
+            // No "*" catch-all command. One used to sit here, and it made both
+            // .recommendCommands() below and its own "[~] That's too arcane."
+            // message unreachable: with a catch-all registered, no command is
+            // ever *unknown*, so a typo was caught by .strict() as
+            // `Unknown arguments: genrate, x.jsonnet` and the suggestion never
+            // fired. Without it, `spellcraft genrate x.jsonnet` gets "Did you
+            // mean generate?", and a bare `spellcraft` gets .demandCommand()'s
+            // message instead of a handler pretending it understood.
 
             .command("doc", "Generates Markdown documentation for the current module and updates README.md", () => {}, 
             (argv) => {
@@ -37,6 +54,12 @@ const spellframe = new SpellFrame();
                     alias: 's',
                     type: 'boolean',
                     description: 'Keep the generated spellcraft_modules aggregate (.spellcraft/modules) for inspection'
+                }).option('ext-str', {
+                    type: 'array',
+                    description: 'Bind a std.extVar as a string: --ext-str name=value (repeatable)'
+                }).option('ext-code', {
+                    type: 'array',
+                    description: 'Bind a std.extVar as Jsonnet code: --ext-code name=<expression> (repeatable)'
                 });
             },
             async (argv) => {
@@ -44,6 +67,18 @@ const spellframe = new SpellFrame();
                 // alias cannot quietly disable it.
                 if (argv['skip-module-cleanup']) {
                     sfInstance.cleanModulesAfterRender = false;
+                }
+
+                // addExternalCode() passes a string through as *code*, which is
+                // what --ext-code wants verbatim. --ext-str has to say it means a
+                // string literal, or a bare `prod` reaches Jsonnet as an
+                // identifier and fails; JSON.stringify is how you say that.
+                for (const [name, value] of parseExternalAssignments(argv['ext-code'], 'ext-code')) {
+                    sfInstance.addExternalCode(name, value);
+                }
+
+                for (const [name, value] of parseExternalAssignments(argv['ext-str'], 'ext-str')) {
+                    sfInstance.addExternalCode(name, JSON.stringify(value));
                 }
 
                 await sfInstance.init();
@@ -110,7 +145,14 @@ const spellframe = new SpellFrame();
     }
 
     try {
-        await setupCli(spellframe);
+        // Constructed inside the try, not at module scope. The constructor does
+        // real work -- plugin discovery, and reading every spellcraft_modules
+        // file -- so it can fail on an ordinary mistake, such as a local module
+        // whose parameter is named after a Jsonnet keyword. From module scope
+        // that reached the user as a raw stack trace with the actual message
+        // buried in it, which is the same failure the .fail() handler below
+        // exists to prevent.
+        await setupCli(new SpellFrame());
     } catch (error) {
         console.error(`[!] ${error.message}`.red);
         process.exit(1);

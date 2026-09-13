@@ -91,3 +91,69 @@ test('--version reports SpellCraft, not the consuming project', () => {
     assert.strictEqual(out.trim(), expected);
     assert.notStrictEqual(out.trim(), '9.9.9', 'reported the consuming project version');
 });
+
+// A manifest reading two external variables, so the flags below have something
+// to bind. std.extVar is standard Jsonnet and was unreachable from the CLI --
+// addExternalCode() has always existed, nothing on `generate` called it -- which
+// left sc.envvar() as the only way to parameterise a spell.
+function extProject() {
+    const dir = project();
+    fs.writeFileSync(path.join(dir, 'm.jsonnet'),
+        '{ "out.json": { who: std.extVar("who"), n: std.extVar("n") } }');
+    return dir;
+}
+
+test('--ext-str and --ext-code reach std.extVar', () => {
+    const dir = extProject();
+
+    const { code, out } = run(['generate', 'm.jsonnet', '--ext-str', 'who=prod', '--ext-code', 'n=1+2'], dir);
+
+    assert.strictEqual(code, 0, out);
+
+    const written = JSON.parse(fs.readFileSync(path.join(dir, 'render', 'out.json'), 'utf-8'));
+
+    // --ext-str has to say it means a *string*: addExternalCode passes a string
+    // through as Jsonnet code, so a bare `prod` would arrive as an identifier.
+    assert.deepStrictEqual(written, { who: 'prod', n: 3 });
+});
+
+test('an external assignment with no name is refused, naming the flag', () => {
+    const { code, out } = run(['generate', 'm.jsonnet', '--ext-str', 'noequals'], extProject());
+
+    assert.notStrictEqual(code, 0);
+    assert.match(out, /--ext-str takes name=value/);
+});
+
+test('a mistyped command is met with a suggestion', () => {
+    // A "*" catch-all command used to sit in the CLI, which made
+    // .recommendCommands() unreachable -- with a catch-all registered no command
+    // is ever *unknown*, so this arrived as `Unknown arguments: genrate, m.jsonnet`.
+    const { code, out } = run(['genrate', 'm.jsonnet'], extProject());
+
+    assert.notStrictEqual(code, 0);
+    assert.match(out, /Did you mean generate\?/);
+});
+
+test('a bare invocation asks for a command rather than pretending to understand', () => {
+    const { code, out } = run([], project());
+
+    assert.notStrictEqual(code, 0);
+    assert.match(out, /You need to specify a command/);
+    assert.doesNotMatch(out, /too arcane/, 'the unreachable catch-all handler ran');
+});
+
+test('a constructor failure is reported as a message, not as a stack trace', () => {
+    // The frame used to be built at module scope, outside the try/catch, so an
+    // ordinary mistake in a local module -- the constructor reads every
+    // spellcraft_modules file -- reached the user as a raw Node stack trace with
+    // the actual message buried in it.
+    const dir = project();
+    fs.mkdirSync(path.join(dir, 'spellcraft_modules'));
+    fs.writeFileSync(path.join(dir, 'spellcraft_modules', 'bad.js'), 'exports.go = (local) => local;\n');
+
+    const { code, out } = run(['--help'], dir);
+
+    assert.notStrictEqual(code, 0);
+    assert.match(out, /parameter named 'local', which is a Jsonnet keyword/);
+    assert.doesNotMatch(out, /\n\s+at /, 'a stack trace reached the user');
+});
